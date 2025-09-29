@@ -1,4 +1,5 @@
 /target
+/self_certs_dir
 .env
 symbols_config.json
 .DS_Store

@@ -5,6 +5,9 @@ use log;
 
 mod schwab_execute_strategy;
 mod schwab_pos;
+mod schwab;
+mod ibkr;
+mod models;
 
 use telegram_bot::{BotState, Command, TelegramBotHandler};
 use teloxide::{prelude::*, types::ChatId, update_listeners, utils::command::BotCommands};

@@ -1,6 +1,5 @@
 use async_trait::async_trait;
 use chrono;
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
@@ -17,51 +16,15 @@ use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 
 // Schwab API imports
-use reqwest::Client;
 use schwab_api::api::Api;
 use schwab_api::error::Error as SchwabError;
 use schwab_api::model::market_data::quote_response::QuoteResponse;
 use schwab_api::model::{Instruction, InstrumentRequest, OrderRequest};
 use schwab_api::token::{TokenChecker, Tokener};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Symbol {
-    pub symbol: String,
-    pub api: Option<String>,
-    pub account_hash: String,
-    pub entry_amount: f64,
-    pub exit_amount: f64,
-    pub entry_threshold: f64,
-    pub exit_threshold: f64,
-}
-
-#[derive(Debug)]
-struct PositionSummary {
-    symbol: String,
-    description: Option<String>,
-    asset_type: Option<String>,
-    quantity: f64,
-    is_short: bool,
-    average_price: Option<f64>,
-    market_value: Option<f64>,
-    cost_basis: Option<f64>,
-    profit_loss: Option<f64>,
-}
-
-#[derive(Debug, Clone, Default)]
-struct RealTimeQuote {
-    last_price: Option<f64>,
-    total_volume: Option<f64>,
-    percent_change: Option<f64>,
-    avg_10_day_volume: Option<f64>,
-}
-
-#[derive(Debug, Clone)]
-pub struct SignalInfo {
-    pub action: String,
-    pub last_price: Option<f64>,
-    pub quantity: f64,
-}
+use crate::schwab;
+use crate::ibkr;
+use crate::models::{Symbol, PositionSummary, RealTimeQuote, SignalInfo};
 
 /// Main trading bot implementation with Schwab API integration.
 pub struct TradingBot {
@@ -70,8 +33,6 @@ pub struct TradingBot {
     pub account_hashes: Vec<String>,
     // Optional IBKR client for routing trades/holdings
     pub ib_client: Option<Arc<ibapi::Client>>,
-    // Tracks whether we've spawned the background order-update subscription task
-    ib_order_updates_started: bool,
     pub positions: Arc<Mutex<HashMap<String, HashMap<String, f64>>>>,
     real_time_prices: Arc<Mutex<HashMap<String, RealTimeQuote>>>,
     pub symbols_config: Vec<Symbol>,
@@ -97,10 +58,6 @@ impl SharedTokenChecker {
         Ok(Self {
             inner: Arc::new(checker),
         })
-    }
-
-    async fn access_token(&self) -> Result<String, SchwabError> {
-        Tokener::get_access_token(&*self.inner).await
     }
 }
 
@@ -217,7 +174,7 @@ impl TradingBot {
         }
 
         // Populate Schwab order history for configured accounts (block on lookup)
-        match Self::populate_order_history_from_schwab(&api, &symbols).await {
+        match Self::populate_order_history_from_schwab(&api, &shared_tokener, &symbols).await {
             Ok(map) => initial_order_history.extend(map.into_iter()),
             Err(e) => eprintln!("Warning: failed to pre-populate Schwab order history: {}", e),
         }
@@ -227,7 +184,6 @@ impl TradingBot {
             tokener: shared_tokener,
             account_hashes,
             ib_client,
-            ib_order_updates_started: false,
             positions: Arc::new(Mutex::new(HashMap::new())),
             real_time_prices: Arc::new(Mutex::new(HashMap::new())),
             symbols_config: symbols,
@@ -243,129 +199,16 @@ impl TradingBot {
         client: &ibapi::Client,
         _sink: Arc<Mutex<HashMap<String, chrono::DateTime<chrono::Utc>>>>,
     ) -> Result<HashMap<String, chrono::DateTime<chrono::Utc>>, Box<dyn std::error::Error + Send + Sync>> {
-        use ibapi::orders::ExecutionFilter;
-
-        let mut result_map: HashMap<String, chrono::DateTime<chrono::Utc>> = HashMap::new();
-
-        // 1) Fetch today's executions
-        let filter = ExecutionFilter::default();
-        match client.executions(filter).await {
-            Ok(mut sub) => {
-                while let Some(item) = sub.next().await {
-                    match item {
-                        Ok(ibapi::orders::Executions::ExecutionData(exec)) => {
-                            let sym = exec.contract.symbol.as_str().to_string();
-                            // parse exec.execution.time if possible; otherwise use now
-                            let when = chrono::Utc::now();
-                            result_map.insert(sym, when);
-                        }
-                        Ok(ibapi::orders::Executions::CommissionReport(_)) => {}
-                        Err(e) => {
-                            eprintln!("Error reading execution stream: {}", e);
-                            break;
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("Failed to request IBKR executions: {}", e);
-            }
-        }
-
-        // 2) Fetch current open orders placed by this API client
-        match client.open_orders().await {
-            Ok(mut sub) => {
-                while let Some(item) = sub.next().await {
-                    match item {
-                        Ok(ibapi::orders::Orders::OrderData(order_data)) => {
-                                // OrderData contains contract directly
-                                let sym = order_data.contract.symbol.as_str().to_string();
-                                result_map.insert(sym, chrono::Utc::now());
-                            }
-                        Ok(ibapi::orders::Orders::OrderStatus(_)) => {}
-                        Ok(ibapi::orders::Orders::Notice(_)) => {}
-                        Err(e) => {
-                            eprintln!("Error reading open_orders stream: {}", e);
-                            break;
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("Failed to request IBKR open orders: {}", e);
-            }
-        }
-
-        // 3) Completed orders may also indicate fills earlier in the day
-        match client.completed_orders(false).await {
-            Ok(mut sub) => {
-                while let Some(item) = sub.next().await {
-                    match item {
-                        Ok(ibapi::orders::Orders::OrderData(order_data)) => {
-                            // Try to extract symbol from order_data.order or contract
-                            let sym = order_data.contract.symbol.as_str().to_string();
-                            result_map.insert(sym, chrono::Utc::now());
-                        }
-                        Ok(ibapi::orders::Orders::OrderStatus(_)) => {}
-                        Ok(ibapi::orders::Orders::Notice(_)) => {}
-                        Err(e) => {
-                            eprintln!("Error reading completed_orders stream: {}", e);
-                            break;
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("Failed to request IBKR completed orders: {}", e);
-            }
-        }
-
-        Ok(result_map)
+        ibkr::populate_order_history_from_ibkr(client).await
     }
 
     /// Query Schwab for recent orders across configured accounts and return a map of symbol->timestamp
     async fn populate_order_history_from_schwab(
         api: &Api<SharedTokenChecker>,
+        tokener: &SharedTokenChecker,
         symbols: &Vec<Symbol>,
     ) -> Result<HashMap<String, chrono::DateTime<chrono::Utc>>, Box<dyn std::error::Error + Send + Sync>> {
-        let mut map: HashMap<String, chrono::DateTime<chrono::Utc>> = HashMap::new();
-
-        // determine unique accounts from symbols
-        let mut accounts: Vec<String> = symbols.iter().map(|s| s.account_hash.clone()).collect();
-        accounts.sort();
-        accounts.dedup();
-
-        let now = chrono::Utc::now();
-        let start = now - chrono::Duration::hours(24);
-
-        for acct in accounts {
-            match api.get_account_orders(acct.clone(), start, now).await {
-                Ok(req) => match req.send().await {
-                    Ok(orders) => {
-                        for order in orders {
-                            // Extract symbol(s) from orderLegCollection
-                            let order_json = serde_json::to_value(&order).unwrap_or(Value::Null);
-                            if let Some(legs) = order_json.get("orderLegCollection").and_then(|v| v.as_array()) {
-                                for leg in legs {
-                                    if let Some(sym) = leg.get("instrument").and_then(|i| i.get("symbol")).and_then(|s| s.as_str()) {
-                                        map.insert(sym.to_string(), chrono::Utc::now());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("Failed to fetch Schwab orders for {}: {}", acct, e);
-                    }
-                },
-                Err(e) => {
-                    eprintln!("Failed to request Schwab orders for {}: {}", acct, e);
-                }
-            }
-        }
-
-        Ok(map)
+        schwab::populate_order_history_from_schwab(tokener, api, symbols).await
     }
 
     /// Fetch positions from IBKR for a given account
@@ -373,83 +216,7 @@ impl TradingBot {
         &self,
         account_id: &str,
     ) -> Result<Vec<PositionSummary>, Box<dyn std::error::Error + Send + Sync>> {
-        let ib_client = self.ib_client.as_ref()
-            .ok_or("IB client not initialized")?;
-
-    use ibapi::accounts::{types::AccountId, AccountUpdate};
-
-        let account = AccountId::from(account_id);
-        let mut subscription = ib_client.account_updates(&account).await?;
-
-        let mut positions: HashMap<String, PositionSummary> = HashMap::new();
-
-        while let Some(update_result) = subscription.next().await {
-            match update_result {
-                Ok(AccountUpdate::PortfolioValue(value)) => {
-                    if value.position.abs() < f64::EPSILON {
-                        continue;
-                    }
-
-                    let contract = value.contract;
-                    let symbol = contract.symbol.to_string();
-                    let description = if contract.description.is_empty() {
-                        None
-                    } else {
-                        Some(contract.description.clone())
-                    };
-                    let asset_type = Some(format!("{}", contract.security_type));
-
-                    let quantity = value.position;
-                    let is_short = quantity < 0.0;
-                    let average_price = if value.average_cost == 0.0 {
-                        None
-                    } else {
-                        Some(value.average_cost)
-                    };
-                    let market_value = if value.market_value == 0.0 {
-                        None
-                    } else {
-                        Some(value.market_value)
-                    };
-                    let cost_basis = average_price.map(|avg| avg * quantity.abs());
-                    let profit_loss = if value.unrealized_pnl == 0.0 {
-                        None
-                    } else {
-                        Some(value.unrealized_pnl)
-                    };
-
-                    positions.insert(
-                        symbol.clone(),
-                        PositionSummary {
-                            symbol,
-                            description,
-                            asset_type,
-                            quantity,
-                            is_short,
-                            average_price,
-                            market_value,
-                            cost_basis,
-                            profit_loss,
-                        },
-                    );
-                }
-                Ok(AccountUpdate::End) => {
-                    subscription.cancel().await;
-                    break;
-                }
-                Ok(_) => {}
-                Err(err) => {
-                    eprintln!("Error receiving IB account update: {err}");
-                    break;
-                }
-            }
-        }
-
-        if positions.is_empty() {
-            subscription.cancel().await;
-        }
-
-        Ok(positions.into_values().collect())
+        ibkr::fetch_ib_positions(self, account_id).await
     }
 
     /// Fetch balance from IBKR for a given account
@@ -457,168 +224,21 @@ impl TradingBot {
         &self,
         account_id: &str,
     ) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
-        let ib_client = self.ib_client.as_ref()
-            .ok_or("IB client not initialized")?;
-
-    use ibapi::accounts::{types::AccountId, AccountUpdate};
-
-        let account = AccountId::from(account_id);
-        let mut subscription = ib_client.account_updates(&account).await?;
-
-        let mut net_liquidation: Option<f64> = None;
-        let mut total_cash: Option<f64> = None;
-
-        while let Some(update_result) = subscription.next().await {
-            match update_result {
-                Ok(AccountUpdate::AccountValue(value)) => {
-                    let tag = value.key.to_string();
-                    let amount = value.value.parse::<f64>().unwrap_or(0.0);
-
-                    match tag.as_str() {
-                        "NetLiquidation" => net_liquidation = Some(amount),
-                        "TotalCashValue" => total_cash = Some(amount),
-                        _ => {}
-                    }
-                }
-                Ok(AccountUpdate::End) => {
-                    subscription.cancel().await;
-                    break;
-                }
-                Ok(_) => {}
-                Err(err) => {
-                    eprintln!("Error receiving IB account update for balance: {err}");
-                    break;
-                }
-            }
-        }
-
-        if net_liquidation.is_none() && total_cash.is_none() {
-            subscription.cancel().await;
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("No account balance data received for {}", account_id),
-            )
-            .into());
-        }
-
-        let balance_value = net_liquidation.or(total_cash).unwrap_or(0.0);
-        Ok(balance_value)
+        ibkr::fetch_ib_balance(self, account_id).await
     }
 
     async fn fetch_positions(
         tokener: &SharedTokenChecker,
         account_hash: &str,
     ) -> Result<Vec<PositionSummary>, Box<dyn std::error::Error + Send + Sync>> {
-        let access_token = tokener.access_token().await?;
-        let client = Client::new();
-        let url =
-            format!("https://api.schwabapi.com/trader/v1/accounts/{account_hash}?fields=positions");
-
-        let response = client
-            .get(url)
-            .bearer_auth(access_token)
-            .header("Accept", "application/json")
-            .send()
-            .await?;
-
-        let status = response.status();
-        let body = response.text().await?;
-        if !status.is_success() {
-            return Err(format!("Failed to fetch positions: {} - {}", status, body).into());
-        }
-
-        let payload: Value = serde_json::from_str(&body)?;
-        let mut pos = Vec::new();
-
-        if let Some(account_obj) = payload.get("securitiesAccount") {
-            if let Some(entries) = account_obj.get("positions").and_then(|v| v.as_array()) {
-                for entry in entries {
-                    let instrument = entry.get("instrument").and_then(|v| v.as_object());
-
-                    let symbol = instrument
-                        .and_then(|inst| inst.get("symbol"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("UNKNOWN")
-                        .to_string();
-
-                    let description = instrument
-                        .and_then(|inst| inst.get("description"))
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
-
-                    let asset_type = instrument
-                        .and_then(|inst| inst.get("assetType"))
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
-
-                    let long_qty = entry
-                        .get("longQuantity")
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or(0.0);
-                    let short_qty = entry
-                        .get("shortQuantity")
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or(0.0);
-
-                    let is_short = short_qty > 0.0 && short_qty >= long_qty;
-                    let quantity = if is_short { -short_qty } else { long_qty };
-
-                    let average_price = entry.get("averagePrice").and_then(|v| v.as_f64());
-                    let market_value = entry.get("marketValue").and_then(|v| v.as_f64());
-                    let cost_basis = entry.get("currentDayCost").and_then(|v| v.as_f64());
-                    let profit_loss = entry.get("longOpenProfitLoss").and_then(|v| v.as_f64());
-
-                    pos.push(PositionSummary {
-                        symbol,
-                        description,
-                        asset_type,
-                        quantity,
-                        is_short,
-                        average_price,
-                        market_value,
-                        cost_basis,
-                        profit_loss,
-                    });
-                }
-            }
-        }
-
-        Ok(pos)
+        schwab::fetch_positions_schwab(tokener, account_hash).await
     }
 
     async fn get_balance(
         api: &Api<SharedTokenChecker>,
         account_hash: &str,
     ) -> Result<Vec<f64>, Box<dyn std::error::Error + Send + Sync>> {
-        let account = api
-            .get_account(account_hash.to_string())
-            .await?
-            .send()
-            .await?;
-
-        // Access the cash balance properly
-        match &account.securities_account {
-            schwab_api::model::trader::accounts::SecuritiesAccount::Cash(cash_account) => {
-                if let Some(current_balances) = &cash_account.current_balances {
-                    return Ok(vec![
-                        current_balances.cash_available_for_trading,
-                        current_balances.liquidation_value.unwrap_or(0.0),
-                    ]);
-                }
-            }
-            schwab_api::model::trader::accounts::SecuritiesAccount::Margin(margin_account) => {
-                if let Some(current_balances) = &margin_account.current_balances {
-                    return Ok(vec![
-                        current_balances.available_funds,
-                        current_balances.buying_power,
-                        current_balances.equity,
-                    ]);
-                }
-            }
-        }
-
-        // Return empty vec if no balances found
-        Ok(vec![])
+        schwab::get_balance_schwab(api, account_hash).await
     }
 
     /// Update account information from Schwab API

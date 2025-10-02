@@ -25,6 +25,7 @@ use schwab_api::token::{TokenChecker, Tokener};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Symbol {
     pub symbol: String,
+    pub api: Option<String>,
     pub account_hash: String,
     pub entry_amount: f64,
     pub exit_amount: f64,
@@ -35,6 +36,7 @@ pub struct Symbol {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SymbolConfig {
     pub symbol: String,
+    pub api: Option<String>,
     pub account_hash: String,
     pub entry_amount: f64,
     pub exit_amount: f64,
@@ -75,10 +77,16 @@ pub struct TradingBot {
     pub api: Option<Api<SharedTokenChecker>>,
     pub tokener: SharedTokenChecker,
     pub account_hashes: Vec<String>,
+    // Optional IBKR client for routing trades/holdings
+    pub ib_client: Option<Arc<ibapi::Client>>,
+    // Tracks whether we've spawned the background order-update subscription task
+    ib_order_updates_started: bool,
     pub positions: Arc<Mutex<HashMap<String, HashMap<String, f64>>>>,
     real_time_prices: Arc<Mutex<HashMap<String, RealTimeQuote>>>,
     pub symbols_config: Vec<Symbol>,
     pub account_balances: Arc<Mutex<HashMap<String, f64>>>,
+    // Track last order date per symbol for daily order limit
+    order_history: Arc<Mutex<HashMap<String, chrono::DateTime<chrono::Utc>>>>,
 }
 
 #[derive(Clone)]
@@ -154,6 +162,7 @@ impl TradingBot {
             account_hash_set.insert(symbol_config.account_hash.clone());
             symbols.push(Symbol {
                 symbol: symbol_config.symbol,
+                api: symbol_config.api,
                 account_hash: symbol_config.account_hash,
                 entry_amount: symbol_config.entry_amount,
                 exit_amount: symbol_config.exit_amount,
@@ -187,15 +196,179 @@ impl TradingBot {
             account_hashes.sort();
         }
 
+        // Connect IBKR client if any symbols require it
+        let needs_ib = symbols.iter().any(|s| s.api.as_deref() == Some("ibkr"));
+        let ib_client = if needs_ib {
+            let host = std::env::var("IBKR_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+            let port: u16 = std::env::var("IBKR_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(4002);
+            let client_id: i32 = std::env::var("IBKR_CLIENT_ID").ok().and_then(|s| s.parse().ok()).unwrap_or(100);
+
+            let endpoint = format!("{}:{}", host, port);
+
+            let client = match ibapi::Client::connect(endpoint.as_str(), client_id).await {
+                Ok(c) => c,
+                Err(e) => return Err(format!("Failed to connect IB client: {}", e).into()),
+            };
+
+            // Optionally request delayed market data for this session
+            if let Err(e) = client.switch_market_data_type(ibapi::market_data::MarketDataType::Delayed).await {
+                eprintln!("Warning: failed to switch market data type to Delayed: {}", e);
+            }
+
+            Some(Arc::new(client))
+        } else {
+            None
+        };
+
         Ok(Self {
             api: Some(api),
             tokener: shared_tokener,
             account_hashes,
+            ib_client,
+            ib_order_updates_started: false,
             positions: Arc::new(Mutex::new(HashMap::new())),
             real_time_prices: Arc::new(Mutex::new(HashMap::new())),
             symbols_config: symbols,
             account_balances: Arc::new(Mutex::new(HashMap::new())),
+            order_history: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    /// Ensure the optional IB client is connected. This is a lazy initializer
+    /// that will attempt to connect to TWS/Gateway using environment variables
+    /// IBKR_HOST, IBKR_PORT, and IBKR_CLIENT_ID when first needed.
+    async fn ensure_ib_client_connected(&mut self) -> Result<Arc<ibapi::Client>, Box<dyn Error + Send + Sync>> {
+        if let Some(ref client) = self.ib_client {
+            return Ok(client.clone());
+        }
+
+        // Only attempt to connect if any symbol needs IBKR
+        let needs_ib = self.symbols_config.iter().any(|s| s.api.as_deref() == Some("ibkr"));
+        if !needs_ib {
+            return Err("IB client not configured for any symbol".into());
+        }
+
+        let host = std::env::var("IBKR_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+        let port: u16 = std::env::var("IBKR_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(4002);
+        let client_id: i32 = std::env::var("IBKR_CLIENT_ID").ok().and_then(|s| s.parse().ok()).unwrap_or(100);
+
+        let endpoint = format!("{}:{}", host, port);
+
+        let client = match ibapi::Client::connect(endpoint.as_str(), client_id).await {
+            Ok(c) => c,
+            Err(e) => return Err(format!("Failed to connect IB client: {}", e).into()),
+        };
+
+        // Optionally request delayed market data for the session
+        if let Err(e) = client.switch_market_data_type(ibapi::market_data::MarketDataType::Delayed).await {
+            eprintln!("Warning: failed to switch market data type to Delayed: {}", e);
+        }
+
+        let arc_client = Arc::new(client);
+        self.ib_client = Some(arc_client.clone());
+
+        // Spawn a background task to listen for order updates and apply fills to our
+        // local cached positions.
+        if !self.ib_order_updates_started {
+            let _cloned_client = arc_client.clone();
+            let _positions_ref = Arc::clone(&self.positions);
+            let _balances_ref = Arc::clone(&self.account_balances);
+
+            tokio::spawn(async move {
+                // Subscribe to order updates (placeholder - actual implementation would use ibapi::orders)
+                eprintln!("IB order update subscription started (placeholder)");
+                // TODO: Implement order update stream when needed
+            });
+
+            self.ib_order_updates_started = true;
+        }
+
+        Ok(arc_client)
+    }
+
+    /// Fetch positions from IBKR for a given account
+    async fn fetch_ib_positions(
+        &self,
+        account_id: &str,
+    ) -> Result<Vec<PositionSummary>, Box<dyn std::error::Error + Send + Sync>> {
+        let ib_client = self.ib_client.as_ref()
+            .ok_or("IB client not initialized")?;
+
+        use ibapi::accounts::{types::AccountId, AccountUpdate};
+        use tokio_stream::StreamExt;
+
+        let account = AccountId::from(account_id);
+        let mut subscription = ib_client.account_updates(&account).await?;
+
+        let mut positions: HashMap<String, PositionSummary> = HashMap::new();
+
+        while let Some(update_result) = subscription.next().await {
+            match update_result {
+                Ok(AccountUpdate::PortfolioValue(value)) => {
+                    if value.position.abs() < f64::EPSILON {
+                        continue;
+                    }
+
+                    let contract = value.contract;
+                    let symbol = contract.symbol.to_string();
+                    let description = if contract.description.is_empty() {
+                        None
+                    } else {
+                        Some(contract.description.clone())
+                    };
+                    let asset_type = Some(format!("{}", contract.security_type));
+
+                    let quantity = value.position;
+                    let is_short = quantity < 0.0;
+                    let average_price = if value.average_cost == 0.0 {
+                        None
+                    } else {
+                        Some(value.average_cost)
+                    };
+                    let market_value = if value.market_value == 0.0 {
+                        None
+                    } else {
+                        Some(value.market_value)
+                    };
+                    let cost_basis = average_price.map(|avg| avg * quantity.abs());
+                    let profit_loss = if value.unrealized_pnl == 0.0 {
+                        None
+                    } else {
+                        Some(value.unrealized_pnl)
+                    };
+
+                    positions.insert(
+                        symbol.clone(),
+                        PositionSummary {
+                            symbol,
+                            description,
+                            asset_type,
+                            quantity,
+                            is_short,
+                            average_price,
+                            market_value,
+                            cost_basis,
+                            profit_loss,
+                        },
+                    );
+                }
+                Ok(AccountUpdate::End) => {
+                    subscription.cancel().await;
+                    break;
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    eprintln!("Error receiving IB account update: {err}");
+                    break;
+                }
+            }
+        }
+
+        if positions.is_empty() {
+            subscription.cancel().await;
+        }
+
+        Ok(positions.into_values().collect())
     }
 
     async fn fetch_positions(
@@ -326,6 +499,19 @@ impl TradingBot {
         let mut aggregated_balances = HashMap::new();
 
         for account_hash in &self.account_hashes {
+            // Determine API based on symbols configured for this account
+            let account_symbols: Vec<&Symbol> = self.symbols_config.iter()
+                .filter(|s| s.account_hash == *account_hash)
+                .collect();
+
+            let uses_ibkr = account_symbols.iter().any(|s| s.api.as_deref() == Some("ibkr"));
+
+            if uses_ibkr {
+                // Skip IBKR accounts for balance fetching - they don't use Schwab API
+                eprintln!("ℹ️ Skipping balance fetch for IBKR account {}", account_hash);
+                continue;
+            }
+
             match Self::get_balance(api, account_hash).await {
                 Ok(values) if !values.is_empty() => {
                     let primary_value = match values.as_slice() {
@@ -370,7 +556,7 @@ impl TradingBot {
         Ok(())
     }
 
-    /// Update positions from Schwab API
+    /// Update positions from Schwab API or IBKR
     pub async fn update_positions(
         &mut self,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -378,34 +564,76 @@ impl TradingBot {
         let mut derived_quotes: HashMap<String, RealTimeQuote> = HashMap::new();
         let mut any_success = false;
 
-        for account_hash in &self.account_hashes {
-            match Self::fetch_positions(&self.tokener, account_hash).await {
-                Ok(position_details) => {
-                    let account_entry = aggregated_positions
-                        .entry(account_hash.clone())
-                        .or_insert_with(HashMap::new);
-                    account_entry.clear();
-                    for pos in &position_details {
-                        account_entry.insert(pos.symbol.clone(), pos.quantity);
+        for account_hash in &self.account_hashes.clone() {
+            // Determine API based on symbols configured for this account
+            let account_symbols: Vec<&Symbol> = self.symbols_config.iter()
+                .filter(|s| s.account_hash == *account_hash)
+                .collect();
 
-                        if let (Some(market_value), quantity) = (pos.market_value, pos.quantity) {
-                            if quantity.abs() > f64::EPSILON {
-                                let last_price = market_value / quantity.abs();
-                                derived_quotes
-                                    .entry(pos.symbol.clone())
-                                    .and_modify(|quote| quote.last_price = Some(last_price))
-                                    .or_insert_with(|| RealTimeQuote {
-                                        last_price: Some(last_price),
-                                        ..Default::default()
-                                    });
+            let uses_ibkr = account_symbols.iter().any(|s| s.api.as_deref() == Some("ibkr"));
+
+            if uses_ibkr {
+                // Fetch from IBKR
+                match self.fetch_ib_positions(account_hash).await {
+                    Ok(position_details) => {
+                        let account_entry = aggregated_positions
+                            .entry(account_hash.clone())
+                            .or_insert_with(HashMap::new);
+                        account_entry.clear();
+                        
+                        for pos in &position_details {
+                            account_entry.insert(pos.symbol.clone(), pos.quantity);
+
+                            if let (Some(market_value), quantity) = (pos.market_value, pos.quantity) {
+                                if quantity.abs() > f64::EPSILON {
+                                    let last_price = market_value / quantity.abs();
+                                    derived_quotes
+                                        .entry(pos.symbol.clone())
+                                        .and_modify(|quote| quote.last_price = Some(last_price))
+                                        .or_insert_with(|| RealTimeQuote {
+                                            last_price: Some(last_price),
+                                            ..Default::default()
+                                        });
+                                }
                             }
                         }
-                    }
 
-                    any_success = true;
+                        any_success = true;
+                    }
+                    Err(err) => {
+                        eprintln!("⚠️ Unable to fetch IBKR positions for {}: {}", account_hash, err);
+                    }
                 }
-                Err(err) => {
-                    eprintln!("⚠️ Unable to fetch positions for {}: {}", account_hash, err);
+            } else {
+                // Fetch from Schwab
+                match Self::fetch_positions(&self.tokener, &account_hash).await {
+                    Ok(position_details) => {
+                        let account_entry = aggregated_positions
+                            .entry(account_hash.clone())
+                            .or_insert_with(HashMap::new);
+                        account_entry.clear();
+                        for pos in &position_details {
+                            account_entry.insert(pos.symbol.clone(), pos.quantity);
+
+                            if let (Some(market_value), quantity) = (pos.market_value, pos.quantity) {
+                                if quantity.abs() > f64::EPSILON {
+                                    let last_price = market_value / quantity.abs();
+                                    derived_quotes
+                                        .entry(pos.symbol.clone())
+                                        .and_modify(|quote| quote.last_price = Some(last_price))
+                                        .or_insert_with(|| RealTimeQuote {
+                                            last_price: Some(last_price),
+                                            ..Default::default()
+                                        });
+                                }
+                            }
+                        }
+
+                        any_success = true;
+                    }
+                    Err(err) => {
+                        eprintln!("⚠️ Unable to fetch Schwab positions for {}: {}", account_hash, err);
+                    }
                 }
             }
         }
@@ -529,7 +757,7 @@ impl TradingBot {
     }
 
     /// Generate a status report
-    pub async fn generate_status_report(&self) -> String {
+    pub async fn generate_status_report(&mut self) -> String {
         let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
         let mut report = format!("📊 Schwab Bot - {}\n\n", timestamp);
 
@@ -595,7 +823,7 @@ impl TradingBot {
             report.push_str("  ⚠️ Schwab API client not initialized.\n\n");
         }
 
-        for account_hash in &self.account_hashes {
+        for account_hash in self.account_hashes.clone() {
             let label = if account_hash.len() > 8 {
                 format!(
                     "{}…{}",
@@ -608,7 +836,98 @@ impl TradingBot {
 
             report.push_str(&format!("Positions for account {}:\n", label));
 
-            match Self::fetch_positions(&self.tokener, account_hash).await {
+            // Determine API based on symbols configured for this account
+            let account_symbols: Vec<&Symbol> = self.symbols_config.iter()
+                .filter(|s| s.account_hash == *account_hash)
+                .collect();
+
+            let uses_ibkr = account_symbols.iter().any(|s| s.api.as_deref() == Some("ibkr"));
+
+            if uses_ibkr {
+                // For IBKR accounts, try to fetch from IBKR if client is available
+                if let Ok(_ib_client) = self.ensure_ib_client_connected().await {
+                    match self.fetch_ib_positions(&account_hash).await {
+                        Ok(position_details) => {
+                            {
+                                let mut positions_guard = self.positions.lock().await;
+                                let entry = positions_guard
+                                    .entry(account_hash.clone())
+                                    .or_insert_with(HashMap::new);
+                                entry.clear();
+                                for pos in &position_details {
+                                    entry.insert(pos.symbol.clone(), pos.quantity);
+                                }
+                            }
+
+                            if position_details.is_empty() {
+                                report.push_str("(No Open Positions)\n\n");
+                            } else {
+                                report.push_str("Symbol Qty      AvgPrice MV     Cost   P / L  \n");
+                                report.push_str("------ -------- -------- ------ ------ ------ \n");
+
+                                let mut total_market_value = 0.0;
+                                let mut total_profit_loss = 0.0;
+
+                                for pos in &position_details {
+                                    let side = if pos.is_short { " S" } else { " L" };
+                                    let quantity_display = format!("{:.0}{}", pos.quantity, side);
+                                    let avg_price = pos
+                                        .average_price
+                                        .map(|v| format!("{:.2}", v))
+                                        .unwrap_or_else(|| "-".to_string());
+                                    let market_value = pos
+                                        .market_value
+                                        .map(|v| {
+                                            total_market_value += v;
+                                            format!("{:.0}", v)
+                                        })
+                                        .unwrap_or_else(|| "-".to_string());
+                                    let cost_basis = pos
+                                        .cost_basis
+                                        .map(|v| format!("{:.0}", v))
+                                        .unwrap_or_else(|| "-".to_string());
+                                    let profit_loss = pos
+                                        .profit_loss
+                                        .map(|v| {
+                                            total_profit_loss += v;
+                                            format!("{:.0}", v)
+                                        })
+                                        .unwrap_or_else(|| "-".to_string());
+
+                                    let short_symbol: String = pos.symbol.chars().take(5).collect();
+
+                                    report.push_str(&format!(
+                                        "{:<6} {:>8} {:>8} {:>6} {:>6} {:>6} \n",
+                                        short_symbol,
+                                        quantity_display,
+                                        avg_price,
+                                        market_value,
+                                        cost_basis,
+                                        profit_loss
+                                    ));
+                                }
+
+                                report.push_str(
+                                    "-----------------------------------------------------------\n",
+                                );
+                                report
+                                    .push_str(&format!("Total Market Value: ${:.2}\n", total_market_value));
+                                report.push_str(&format!(
+                                    "Total P/L:          ${:.2}\n\n",
+                                    total_profit_loss
+                                ));
+                            }
+                        }
+                        Err(err) => {
+                            report.push_str(&format!("  ⚠️ Unable to fetch IBKR positions: {}\n\n", err));
+                        }
+                    }
+                } else {
+                    report.push_str("  ⚠️ IBKR client not connected (missing environment variables)\n\n");
+                }
+            } else {
+                // For Schwab accounts, fetch from Schwab API
+                match Self::fetch_positions(&self.tokener, &account_hash).await {
                 Ok(position_details) => {
                     {
                         let mut positions_guard = self.positions.lock().await;
@@ -685,6 +1004,7 @@ impl TradingBot {
                 }
             }
         }
+    }
 
         if let Some(api) = self.api.as_ref() {
             let lookback_end = chrono::Utc::now();
@@ -1078,18 +1398,21 @@ impl TradingBot {
         Ok(())
     }
 
+    /// Estimate Schwab commission for an order (flat fee from env var)
+    fn estimate_schwab_commission(&self, _qty: f64, _price: f64) -> f64 {
+        std::env::var("SCHWAB_COMMISSION_FLAT")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(0.0)
+    }
+
     pub async fn send_limit_order(
-        &self,
+        &mut self,
         symbol_key: &str,
         side: &str,
         qty: f64,
         limit_price: f64,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let api = self
-            .api
-            .as_ref()
-            .ok_or("Schwab API client not initialized")?;
-
         let (symbol, account_hash) = symbol_key
             .split_once('@')
             .ok_or("Symbol key must be in SYMBOL@ACCOUNT format")?;
@@ -1100,50 +1423,102 @@ impl TradingBot {
             .find(|cfg| cfg.account_hash == account_hash && cfg.symbol.eq_ignore_ascii_case(symbol))
             .ok_or("Symbol/account combination not configured")?;
 
-        let instruction = match side.to_ascii_uppercase().as_str() {
-            "BUY" | "B" => Instruction::Buy,
-            "SELL" | "S" => Instruction::Sell,
-            other => {
-                return Err(format!("Unsupported side '{other}'. Expected BUY or SELL.").into())
+        // Risk check: limit one order per symbol per day
+        {
+            let mut order_history = self.order_history.lock().await;
+            let now = chrono::Utc::now();
+            let today = now.date_naive();
+
+            if let Some(last_order_time) = order_history.get(&symbol_cfg.symbol) {
+                let last_order_date = last_order_time.date_naive();
+                if last_order_date == today {
+                    return Err(format!(
+                        "Order blocked: only one order per symbol per day allowed. Last order for {} was on {}",
+                        symbol_cfg.symbol, last_order_date
+                    ).into());
+                }
             }
-        };
 
-        // Risk management checks
-        if qty <= 0.0 {
-            return Err("Quantity must be greater than zero".into());
+            // Update the order history with current timestamp
+            order_history.insert(symbol_cfg.symbol.to_string(), now);
         }
 
-        if limit_price <= 0.0 {
-            return Err("Limit price must be greater than zero".into());
+        // Route based on symbol's api field
+        if symbol_cfg.api.as_deref() == Some("ibkr") {
+            // Route to IBKR
+            let _ib_client = self.ensure_ib_client_connected().await?;
+
+            // TODO: Implement IB order placement
+            // The ibapi library needs proper Order construction
+            // For now, return an error to indicate this path is not yet fully implemented
+            return Err(format!(
+                "IBKR routing configured for {} but order placement not yet fully implemented. \
+                Need to construct proper ibapi::orders::Order and place via client.place_order()",
+                symbol
+            ).into());
+        } else {
+            // Route to Schwab (default)
+            let api = self
+                .api
+                .as_ref()
+                .ok_or("Schwab API client not initialized")?;
+
+            let instruction = match side.to_ascii_uppercase().as_str() {
+                "BUY" | "B" => Instruction::Buy,
+                "SELL" | "S" => Instruction::Sell,
+                other => {
+                    return Err(format!("Unsupported side '{other}'. Expected BUY or SELL.").into())
+                }
+            };
+
+            // Risk management checks
+            if qty <= 0.0 {
+                return Err("Quantity must be greater than zero".into());
+            }
+
+            if limit_price <= 0.0 {
+                return Err("Limit price must be greater than zero".into());
+            }
+
+            let rounded_price = (limit_price * 100.0).round() / 100.0;
+
+            // Commission Policy B: block order if estimated commission > 0
+            let estimated_commission = self.estimate_schwab_commission(qty, rounded_price);
+            if estimated_commission > 0.0 {
+                return Err(format!(
+                    "Order blocked by commission policy: estimated commission ${:.2} exceeds threshold",
+                    estimated_commission
+                ).into());
+            }
+
+            self.evaluate_order_risks(
+                api,
+                &symbol_cfg.account_hash,
+                &symbol_cfg.symbol,
+                instruction,
+                qty,
+                rounded_price,
+            )
+            .await
+            .map_err(|msg| io::Error::new(io::ErrorKind::Other, msg))?;
+
+            let order = OrderRequest::limit(
+                InstrumentRequest::Equity {
+                    symbol: symbol_cfg.symbol.clone(),
+                },
+                instruction,
+                qty,
+                rounded_price,
+            )?;
+
+            api.post_account_order(symbol_cfg.account_hash.clone(), order)
+                .await?
+                .send()
+                .await?;
+
+            eprintln!("✓ Schwab order placed: {}@{} {} shares at ${:.2}", symbol, account_hash, qty, rounded_price);
+            Ok(())
         }
-
-        let rounded_price = (limit_price * 100.0).round() / 100.0;
-        self.evaluate_order_risks(
-            api,
-            &symbol_cfg.account_hash,
-            &symbol_cfg.symbol,
-            instruction,
-            qty,
-            rounded_price,
-        )
-        .await
-        .map_err(|msg| io::Error::new(io::ErrorKind::Other, msg))?;
-
-        let order = OrderRequest::limit(
-            InstrumentRequest::Equity {
-                symbol: symbol_cfg.symbol.clone(),
-            },
-            instruction,
-            qty,
-            rounded_price,
-        )?;
-
-        api.post_account_order(symbol_cfg.account_hash.clone(), order)
-            .await?
-            .send()
-            .await?;
-
-        Ok(())
     }
 
     /// Reads and parses the symbols configuration file.

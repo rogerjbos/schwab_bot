@@ -5,6 +5,8 @@ edition = "2021"
 
 [dependencies]
 schwab_api = "0.0.2"
+ibapi = { git = "https://github.com/wboayue/rust-ibapi", features = ["async"] }
+tokio-stream = "0.1"
 async-channel = "2.3"
 axum = { version = "0.7" }
 axum-server = "0.6"

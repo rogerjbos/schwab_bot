@@ -13,6 +13,8 @@ use std::{
 use telegram_bot::BotState;
 use teloxide::{prelude::*, types::ChatId};
 use tokio::sync::Mutex;
+use tokio::fs::OpenOptions;
+use tokio::io::AsyncWriteExt;
 
 // Schwab API imports
 use reqwest::Client;
@@ -24,17 +26,6 @@ use schwab_api::token::{TokenChecker, Tokener};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Symbol {
-    pub symbol: String,
-    pub api: Option<String>,
-    pub account_hash: String,
-    pub entry_amount: f64,
-    pub exit_amount: f64,
-    pub entry_threshold: f64,
-    pub exit_threshold: f64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SymbolConfig {
     pub symbol: String,
     pub api: Option<String>,
     pub account_hash: String,
@@ -158,17 +149,9 @@ impl TradingBot {
         let mut symbols = Vec::new();
         let mut account_hash_set = HashSet::new();
 
-        for symbol_config in raw_symbols {
-            account_hash_set.insert(symbol_config.account_hash.clone());
-            symbols.push(Symbol {
-                symbol: symbol_config.symbol,
-                api: symbol_config.api,
-                account_hash: symbol_config.account_hash,
-                entry_amount: symbol_config.entry_amount,
-                exit_amount: symbol_config.exit_amount,
-                entry_threshold: symbol_config.entry_threshold,
-                exit_threshold: symbol_config.exit_threshold,
-            });
+        for symbol in raw_symbols {
+            account_hash_set.insert(symbol.account_hash.clone());
+            symbols.push(symbol);
         }
 
         let mut account_hashes: Vec<String> = account_hash_set.into_iter().collect();
@@ -210,6 +193,7 @@ impl TradingBot {
                 Err(e) => return Err(format!("Failed to connect IB client: {}", e).into()),
             };
 
+            // probably won't end up using IBKR market data
             // Optionally request delayed market data for this session
             if let Err(e) = client.switch_market_data_type(ibapi::market_data::MarketDataType::Delayed).await {
                 eprintln!("Warning: failed to switch market data type to Delayed: {}", e);
@@ -219,6 +203,24 @@ impl TradingBot {
         } else {
             None
         };
+
+        // If we have an IB client, attempt to pre-populate today's order history from IBKR
+        // We'll synchronously fetch today's executions and open/completed orders during init so
+        // the in-memory `order_history` prevents duplicate orders across restarts.
+        let mut initial_order_history: HashMap<String, chrono::DateTime<chrono::Utc>> = HashMap::new();
+        // Populate IBKR history first
+        if let Some(ref client) = ib_client {
+            match Self::populate_order_history_from_ibkr(client, Arc::new(Mutex::new(HashMap::new()))).await {
+                Ok(map) => initial_order_history.extend(map.into_iter()),
+                Err(e) => eprintln!("Warning: failed to pre-populate IBKR order history: {}", e),
+            }
+        }
+
+        // Populate Schwab order history for configured accounts (block on lookup)
+        match Self::populate_order_history_from_schwab(&api, &symbols).await {
+            Ok(map) => initial_order_history.extend(map.into_iter()),
+            Err(e) => eprintln!("Warning: failed to pre-populate Schwab order history: {}", e),
+        }
 
         Ok(Self {
             api: Some(api),
@@ -230,60 +232,140 @@ impl TradingBot {
             real_time_prices: Arc::new(Mutex::new(HashMap::new())),
             symbols_config: symbols,
             account_balances: Arc::new(Mutex::new(HashMap::new())),
-            order_history: Arc::new(Mutex::new(HashMap::new())),
+            order_history: Arc::new(Mutex::new(initial_order_history)),
         })
     }
 
-    /// Ensure the optional IB client is connected. This is a lazy initializer
-    /// that will attempt to connect to TWS/Gateway using environment variables
-    /// IBKR_HOST, IBKR_PORT, and IBKR_CLIENT_ID when first needed.
-    async fn ensure_ib_client_connected(&mut self) -> Result<Arc<ibapi::Client>, Box<dyn Error + Send + Sync>> {
-        if let Some(ref client) = self.ib_client {
-            return Ok(client.clone());
+    /// Query IBKR for today's executions and open/completed orders and return a map of
+    /// symbol -> latest execution/filled timestamp for today. This helps prevent duplicate
+    /// orders for the same symbol in the same day after a restart.
+    async fn populate_order_history_from_ibkr(
+        client: &ibapi::Client,
+        _sink: Arc<Mutex<HashMap<String, chrono::DateTime<chrono::Utc>>>>,
+    ) -> Result<HashMap<String, chrono::DateTime<chrono::Utc>>, Box<dyn std::error::Error + Send + Sync>> {
+        use ibapi::orders::ExecutionFilter;
+
+        let mut result_map: HashMap<String, chrono::DateTime<chrono::Utc>> = HashMap::new();
+
+        // 1) Fetch today's executions
+        let filter = ExecutionFilter::default();
+        match client.executions(filter).await {
+            Ok(mut sub) => {
+                while let Some(item) = sub.next().await {
+                    match item {
+                        Ok(ibapi::orders::Executions::ExecutionData(exec)) => {
+                            let sym = exec.contract.symbol.as_str().to_string();
+                            // parse exec.execution.time if possible; otherwise use now
+                            let when = chrono::Utc::now();
+                            result_map.insert(sym, when);
+                        }
+                        Ok(ibapi::orders::Executions::CommissionReport(_)) => {}
+                        Err(e) => {
+                            eprintln!("Error reading execution stream: {}", e);
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("Failed to request IBKR executions: {}", e);
+            }
         }
 
-        // Only attempt to connect if any symbol needs IBKR
-        let needs_ib = self.symbols_config.iter().any(|s| s.api.as_deref() == Some("ibkr"));
-        if !needs_ib {
-            return Err("IB client not configured for any symbol".into());
+        // 2) Fetch current open orders placed by this API client
+        match client.open_orders().await {
+            Ok(mut sub) => {
+                while let Some(item) = sub.next().await {
+                    match item {
+                        Ok(ibapi::orders::Orders::OrderData(order_data)) => {
+                                // OrderData contains contract directly
+                                let sym = order_data.contract.symbol.as_str().to_string();
+                                result_map.insert(sym, chrono::Utc::now());
+                            }
+                        Ok(ibapi::orders::Orders::OrderStatus(_)) => {}
+                        Ok(ibapi::orders::Orders::Notice(_)) => {}
+                        Err(e) => {
+                            eprintln!("Error reading open_orders stream: {}", e);
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("Failed to request IBKR open orders: {}", e);
+            }
         }
 
-        let host = std::env::var("IBKR_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
-        let port: u16 = std::env::var("IBKR_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(4002);
-        let client_id: i32 = std::env::var("IBKR_CLIENT_ID").ok().and_then(|s| s.parse().ok()).unwrap_or(100);
-
-        let endpoint = format!("{}:{}", host, port);
-
-        let client = match ibapi::Client::connect(endpoint.as_str(), client_id).await {
-            Ok(c) => c,
-            Err(e) => return Err(format!("Failed to connect IB client: {}", e).into()),
-        };
-
-        // Optionally request delayed market data for the session
-        if let Err(e) = client.switch_market_data_type(ibapi::market_data::MarketDataType::Delayed).await {
-            eprintln!("Warning: failed to switch market data type to Delayed: {}", e);
+        // 3) Completed orders may also indicate fills earlier in the day
+        match client.completed_orders(false).await {
+            Ok(mut sub) => {
+                while let Some(item) = sub.next().await {
+                    match item {
+                        Ok(ibapi::orders::Orders::OrderData(order_data)) => {
+                            // Try to extract symbol from order_data.order or contract
+                            let sym = order_data.contract.symbol.as_str().to_string();
+                            result_map.insert(sym, chrono::Utc::now());
+                        }
+                        Ok(ibapi::orders::Orders::OrderStatus(_)) => {}
+                        Ok(ibapi::orders::Orders::Notice(_)) => {}
+                        Err(e) => {
+                            eprintln!("Error reading completed_orders stream: {}", e);
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("Failed to request IBKR completed orders: {}", e);
+            }
         }
 
-        let arc_client = Arc::new(client);
-        self.ib_client = Some(arc_client.clone());
+        Ok(result_map)
+    }
 
-        // Spawn a background task to listen for order updates and apply fills to our
-        // local cached positions.
-        if !self.ib_order_updates_started {
-            let _cloned_client = arc_client.clone();
-            let _positions_ref = Arc::clone(&self.positions);
-            let _balances_ref = Arc::clone(&self.account_balances);
+    /// Query Schwab for recent orders across configured accounts and return a map of symbol->timestamp
+    async fn populate_order_history_from_schwab(
+        api: &Api<SharedTokenChecker>,
+        symbols: &Vec<Symbol>,
+    ) -> Result<HashMap<String, chrono::DateTime<chrono::Utc>>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut map: HashMap<String, chrono::DateTime<chrono::Utc>> = HashMap::new();
 
-            tokio::spawn(async move {
-                // Subscribe to order updates (placeholder - actual implementation would use ibapi::orders)
-                eprintln!("IB order update subscription started (placeholder)");
-                // TODO: Implement order update stream when needed
-            });
+        // determine unique accounts from symbols
+        let mut accounts: Vec<String> = symbols.iter().map(|s| s.account_hash.clone()).collect();
+        accounts.sort();
+        accounts.dedup();
 
-            self.ib_order_updates_started = true;
+        let now = chrono::Utc::now();
+        let start = now - chrono::Duration::hours(24);
+
+        for acct in accounts {
+            match api.get_account_orders(acct.clone(), start, now).await {
+                Ok(req) => match req.send().await {
+                    Ok(orders) => {
+                        for order in orders {
+                            // Extract symbol(s) from orderLegCollection
+                            let order_json = serde_json::to_value(&order).unwrap_or(Value::Null);
+                            if let Some(legs) = order_json.get("orderLegCollection").and_then(|v| v.as_array()) {
+                                for leg in legs {
+                                    if let Some(sym) = leg.get("instrument").and_then(|i| i.get("symbol")).and_then(|s| s.as_str()) {
+                                        map.insert(sym.to_string(), chrono::Utc::now());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to fetch Schwab orders for {}: {}", acct, e);
+                    }
+                },
+                Err(e) => {
+                    eprintln!("Failed to request Schwab orders for {}: {}", acct, e);
+                }
+            }
         }
 
-        Ok(arc_client)
+        Ok(map)
     }
 
     /// Fetch positions from IBKR for a given account
@@ -294,8 +376,7 @@ impl TradingBot {
         let ib_client = self.ib_client.as_ref()
             .ok_or("IB client not initialized")?;
 
-        use ibapi::accounts::{types::AccountId, AccountUpdate};
-        use tokio_stream::StreamExt;
+    use ibapi::accounts::{types::AccountId, AccountUpdate};
 
         let account = AccountId::from(account_id);
         let mut subscription = ib_client.account_updates(&account).await?;
@@ -369,6 +450,59 @@ impl TradingBot {
         }
 
         Ok(positions.into_values().collect())
+    }
+
+    /// Fetch balance from IBKR for a given account
+    async fn fetch_ib_balance(
+        &self,
+        account_id: &str,
+    ) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
+        let ib_client = self.ib_client.as_ref()
+            .ok_or("IB client not initialized")?;
+
+    use ibapi::accounts::{types::AccountId, AccountUpdate};
+
+        let account = AccountId::from(account_id);
+        let mut subscription = ib_client.account_updates(&account).await?;
+
+        let mut net_liquidation: Option<f64> = None;
+        let mut total_cash: Option<f64> = None;
+
+        while let Some(update_result) = subscription.next().await {
+            match update_result {
+                Ok(AccountUpdate::AccountValue(value)) => {
+                    let tag = value.key.to_string();
+                    let amount = value.value.parse::<f64>().unwrap_or(0.0);
+
+                    match tag.as_str() {
+                        "NetLiquidation" => net_liquidation = Some(amount),
+                        "TotalCashValue" => total_cash = Some(amount),
+                        _ => {}
+                    }
+                }
+                Ok(AccountUpdate::End) => {
+                    subscription.cancel().await;
+                    break;
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    eprintln!("Error receiving IB account update for balance: {err}");
+                    break;
+                }
+            }
+        }
+
+        if net_liquidation.is_none() && total_cash.is_none() {
+            subscription.cancel().await;
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("No account balance data received for {}", account_id),
+            )
+            .into());
+        }
+
+        let balance_value = net_liquidation.or(total_cash).unwrap_or(0.0);
+        Ok(balance_value)
     }
 
     async fn fetch_positions(
@@ -507,40 +641,34 @@ impl TradingBot {
             let uses_ibkr = account_symbols.iter().any(|s| s.api.as_deref() == Some("ibkr"));
 
             if uses_ibkr {
-                // Skip IBKR accounts for balance fetching - they don't use Schwab API
-                eprintln!("ℹ️ Skipping balance fetch for IBKR account {}", account_hash);
-                continue;
-            }
+                // Fetch from IBKR
+                match self.fetch_ib_balance(account_hash).await {
+                    Ok(balance) => {
+                        aggregated_balances.insert(account_hash.clone(), balance);
+                        any_success = true;
+                    }
+                    Err(err) => {
+                        eprintln!("⚠️ Unable to fetch IBKR balance for {}: {}", account_hash, err);
+                    }
+                }
+            } else {
+                match Self::get_balance(api, account_hash).await {
+                    Ok(values) => {
+                        if values.is_empty() {
+                            // Empty balance payload
+                        } else {
+                            let primary_value = values.get(if values.len() == 3 { 2 } else { 1 }).copied().unwrap_or_else(|| values.last().copied().unwrap_or(0.0));
 
-            match Self::get_balance(api, account_hash).await {
-                Ok(values) if !values.is_empty() => {
-                    let primary_value = match values.as_slice() {
-                        [_, liquidation] => *liquidation,
-                        [_, _, equity] => *equity,
-                        slice => {
-                            eprintln!(
-                                "⚠️ Unexpected balance format ({} values) when updating account info for {}.",
-                                slice.len(),
-                                account_hash
-                            );
-                            *slice.last().unwrap_or(&0.0)
+                            aggregated_balances.insert(account_hash.clone(), primary_value);
+                            any_success = true;
                         }
-                    };
-
-                    aggregated_balances.insert(account_hash.clone(), primary_value);
-                    any_success = true;
+                    }
+                    Err(err) => {
+                        eprintln!("⚠️ Unable to fetch balances for {}: {}", account_hash, err);
+                    }
                 }
-                Ok(_) => {
-                    eprintln!(
-                        "⚠️ Balance payload was empty when updating account info for {}.",
-                        account_hash
-                    );
-                }
-                Err(err) => {
-                    eprintln!("⚠️ Unable to fetch balances for {}: {}", account_hash, err);
                 }
             }
-        }
 
         if !any_success {
             return Err(io::Error::new(
@@ -845,7 +973,7 @@ impl TradingBot {
 
             if uses_ibkr {
                 // For IBKR accounts, try to fetch from IBKR if client is available
-                if let Ok(_ib_client) = self.ensure_ib_client_connected().await {
+                if self.ib_client.is_some() {
                     match self.fetch_ib_positions(&account_hash).await {
                         Ok(position_details) => {
                             {
@@ -1363,7 +1491,7 @@ impl TradingBot {
             let threshold = portfolio_value * 0.01;
             if projected_notional > threshold {
                 return Err(format!(
-                    "Order would raise {} exposure to ${:.2}, breaching 1% cap (${:.2}) on portfolio ${:.2}",
+                    "Order would raise {} exposure to ${:.2}, > 1% cap (${:.2}) on portfolio ${:.2}",
                     symbol, projected_notional, threshold, portfolio_value
                 ));
             }
@@ -1446,16 +1574,183 @@ impl TradingBot {
         // Route based on symbol's api field
         if symbol_cfg.api.as_deref() == Some("ibkr") {
             // Route to IBKR
-            let _ib_client = self.ensure_ib_client_connected().await?;
+            let ib_client = self
+                .ib_client
+                .as_ref()
+                .ok_or("IB client not initialized")?
+                .clone();
 
-            // TODO: Implement IB order placement
-            // The ibapi library needs proper Order construction
-            // For now, return an error to indicate this path is not yet fully implemented
-            return Err(format!(
-                "IBKR routing configured for {} but order placement not yet fully implemented. \
-                Need to construct proper ibapi::orders::Order and place via client.place_order()",
-                symbol
-            ).into());
+            // Build contract and order using rust-ibapi helpers
+            let contract = ibapi::contracts::Contract::stock(&symbol_cfg.symbol).build();
+
+            let action = match side.to_ascii_uppercase().as_str() {
+                "BUY" | "B" => ibapi::orders::Action::Buy,
+                "SELL" | "S" => ibapi::orders::Action::Sell,
+                other => {
+                    return Err(format!("Unsupported side '{other}'. Expected BUY or SELL.").into())
+                }
+            };
+
+            if qty <= 0.0 {
+                return Err("Quantity must be greater than zero".into());
+            }
+
+            if limit_price <= 0.0 {
+                return Err("Limit price must be greater than zero".into());
+            }
+
+            // Run the same risk checks as Schwab orders before placing the IBKR order
+            // Convert action to Schwab Instruction for risk checking
+            let instruction = match side.to_ascii_uppercase().as_str() {
+                "BUY" | "B" => Instruction::Buy,
+                "SELL" | "S" => Instruction::Sell,
+                _ => Instruction::Buy, // already validated above
+            };
+
+            // Apply the shared risk checks (will use cached balances/positions)
+            if let Some(api) = self.api.as_ref() {
+                // We call evaluate_order_risks to validate sizing, cash, deviation, etc.
+                self.evaluate_order_risks(
+                    api,
+                    &symbol_cfg.account_hash,
+                    &symbol_cfg.symbol,
+                    instruction,
+                    qty,
+                    limit_price,
+                )
+                .await
+                .map_err(|msg| io::Error::new(io::ErrorKind::Other, msg))?;
+            } else {
+                // If Schwab API isn't present, still try to perform local checks using cached balances
+                // (evaluate_order_risks needs Api for balance fetch on buys). For now, proceed.
+            }
+
+            let order = ibapi::orders::order_builder::limit_order(action, qty, limit_price);
+
+            // Get an order id and place the order, subscribing to updates
+            let order_id = ib_client.next_order_id();
+
+            match ib_client.place_order(order_id, &contract, &order).await {
+                Ok(mut subscription) => {
+                    // Spawn background task to monitor order updates for this order
+                    let symbol_name = symbol_cfg.symbol.clone();
+                    // note: do not rely on the configured account for fills; use the execution's account
+                    let account_hash_clone_config = symbol_cfg.account_hash.clone();
+                    let positions_map = Arc::clone(&self.positions);
+                    let order_history_map = Arc::clone(&self.order_history);
+
+                    tokio::spawn(async move {
+                        while let Some(event) = subscription.next().await {
+                            match event {
+                                Ok(ibapi::orders::PlaceOrder::OrderStatus(status)) => {
+                                    eprintln!(
+                                        "[IBKR Order {}] status: {} filled: {}/{} avg_fill_price: {:?}",
+                                        status.order_id, status.status, status.filled, status.remaining, status.average_fill_price
+                                    );
+
+                                    // If order is filled, update order_history timestamp to now
+                                    if status.status == "Filled" {
+                                        let mut hist = order_history_map.lock().await;
+                                        hist.insert(symbol_name.clone(), chrono::Utc::now());
+                                    }
+                                }
+                                Ok(ibapi::orders::PlaceOrder::ExecutionData(exec)) => {
+                                    eprintln!(
+                                        "[IBKR Execution] {} {} shares @ {} on {}",
+                                        exec.contract.symbol, exec.execution.shares, exec.execution.price, exec.execution.exchange
+                                    );
+
+                                    // Update cached positions using the execution's account number
+                                    let exec_account = if exec.execution.account_number.is_empty() {
+                                        account_hash_clone_config.clone()
+                                    } else {
+                                        exec.execution.account_number.clone()
+                                    };
+                                    let side = exec.execution.side.to_uppercase();
+                                    let shares = exec.execution.shares;
+
+                                    // Persist execution to CSV for auditing
+                                    let exec_csv_line = format!("{},{},{},{},{},{},{}\n",
+                                        chrono::Utc::now().to_rfc3339(),
+                                        exec.execution.execution_id,
+                                        exec_account,
+                                        exec.contract.symbol.as_str(),
+                                        exec.execution.side,
+                                        exec.execution.shares,
+                                        exec.execution.price
+                                    );
+
+                                    if let Ok(mut file) = OpenOptions::new()
+                                        .create(true)
+                                        .append(true)
+                                        .open("output/ibkr_executions.csv")
+                                        .await
+                                    {
+                                        let _ = file.write_all(exec_csv_line.as_bytes()).await;
+                                    }
+
+                                    let mut positions_guard = positions_map.lock().await;
+                                    let account_entry = positions_guard
+                                        .entry(exec_account.clone())
+                                        .or_insert_with(HashMap::new);
+
+                                    let current_qty = account_entry
+                                        .get(exec.contract.symbol.as_str())
+                                        .copied()
+                                        .unwrap_or(0.0);
+
+                                    let new_qty = if side == "BUY" || side == "BOT" {
+                                        current_qty + shares
+                                    } else {
+                                        current_qty - shares
+                                    };
+
+                                    account_entry.insert(exec.contract.symbol.as_str().to_string(), new_qty);
+                                }
+                                Ok(ibapi::orders::PlaceOrder::OpenOrder(open_order)) => {
+                                    eprintln!(
+                                        "[IBKR OpenOrder] {} id {} action {:?} qty {} status {}",
+                                        symbol_name, open_order.order.order_id, open_order.order.action, open_order.order.total_quantity, open_order.order_state.status
+                                    );
+                                }
+                                Ok(ibapi::orders::PlaceOrder::CommissionReport(report)) => {
+                                    eprintln!("[IBKR Commission] {} {}", report.execution_id, report.commission);
+
+                                    // Persist commission report to CSV
+                                    let comm_csv_line = format!("{},{},{},{}\n",
+                                        chrono::Utc::now().to_rfc3339(),
+                                        report.execution_id,
+                                        report.commission,
+                                        report.currency
+                                    );
+
+                                    if let Ok(mut file) = OpenOptions::new()
+                                        .create(true)
+                                        .append(true)
+                                        .open("output/ibkr_commissions.csv")
+                                        .await
+                                    {
+                                        let _ = file.write_all(comm_csv_line.as_bytes()).await;
+                                    }
+                                }
+                                Ok(ibapi::orders::PlaceOrder::Message(msg)) => {
+                                    eprintln!("[IBKR Order Message] {} - {}", msg.code, msg.message);
+                                }
+                                Err(e) => {
+                                    eprintln!("Error in IBKR order subscription: {e}");
+                                    break;
+                                }
+                            }
+                        }
+                    });
+
+                    eprintln!("✓ IBKR order submitted: {} {} shares @ ${:.2} (order_id {})", side, qty, limit_price, order_id);
+                    return Ok(());
+                }
+                Err(err) => {
+                    return Err(format!("Failed to place IBKR order: {}", err).into());
+                }
+            }
         } else {
             // Route to Schwab (default)
             let api = self
@@ -1524,11 +1819,12 @@ impl TradingBot {
     /// Reads and parses the symbols configuration file.
     async fn read_symbols_config(
         file_path: &str,
-    ) -> Result<Vec<SymbolConfig>, Box<dyn Error + Send + Sync>> {
+    ) -> Result<Vec<Symbol>, Box<dyn Error + Send + Sync>> {
         let content = tokio::fs::read_to_string(file_path).await?;
-        let symbols_config: Vec<SymbolConfig> = serde_json::from_str(&content)?;
-        Ok(symbols_config)
+        let symbols: Vec<Symbol> = serde_json::from_str(&content)?;
+        Ok(symbols)
     }
+
 }
 
 fn format_int(value: i64) -> String {

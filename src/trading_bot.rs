@@ -1666,7 +1666,7 @@ impl telegram_bot::TradingBot for TradingBot {
         telegram_bot: Bot,
         chat_id: ChatId,
     ) -> Result<(), Self::Error> {
-        crate::schwab_execute_strategy::execute_strategy_internal(
+        crate::execute_strategy::execute_strategy_internal(
             self,
             bot_state,
             telegram_bot,

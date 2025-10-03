@@ -3,8 +3,8 @@ use std::{error::Error, sync::Arc};
 use dotenv::dotenv;
 use log;
 
-mod schwab_execute_strategy;
-mod schwab_pos;
+mod execute_strategy;
+mod trading_bot;
 mod schwab;
 mod ibkr;
 mod models;
@@ -13,7 +13,7 @@ use telegram_bot::{BotState, Command, TelegramBotHandler};
 use teloxide::{prelude::*, types::ChatId, update_listeners, utils::command::BotCommands};
 use tokio::sync::Mutex;
 
-use crate::schwab_pos::TradingBot;
+use crate::trading_bot::TradingBot;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {

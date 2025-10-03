@@ -4,7 +4,7 @@ use telegram_bot::{send_telegram_notification, BotState, NotificationLevel};
 use teloxide::{types::ChatId, Bot};
 use tokio::sync::Mutex;
 
-use crate::schwab_pos::TradingBot;
+use crate::trading_bot::TradingBot;
 
 /// Execute the trading strategy for the Schwab bot
 pub async fn execute_strategy_internal(

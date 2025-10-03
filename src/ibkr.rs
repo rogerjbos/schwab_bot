@@ -4,7 +4,7 @@ use crate::models::PositionSummary;
 use ibapi::orders::ExecutionFilter;
 
 pub async fn fetch_ib_positions(
-    owner: &crate::schwab_pos::TradingBot,
+    owner: &crate::trading_bot::TradingBot,
     account_id: &str,
     ) -> Result<Vec<PositionSummary>, Box<dyn Error + Send + Sync>> {
     let ib_client = owner.ib_client.as_ref().ok_or("IB client not initialized")?.clone();
@@ -86,7 +86,7 @@ pub async fn fetch_ib_positions(
 }
 
 pub async fn fetch_ib_balance(
-    owner: &crate::schwab_pos::TradingBot,
+    owner: &crate::trading_bot::TradingBot,
     account_id: &str,
 ) -> Result<f64, Box<dyn Error + Send + Sync>> {
     let ib_client = owner.ib_client.as_ref().ok_or("IB client not initialized")?.clone();

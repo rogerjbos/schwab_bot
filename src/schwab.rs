@@ -1,4 +1,4 @@
-use crate::schwab_pos::SharedTokenChecker;
+use crate::trading_bot::SharedTokenChecker;
 use crate::models::{PositionSummary, Symbol};
 use schwab_api::token::Tokener;
 use serde_json::Value;

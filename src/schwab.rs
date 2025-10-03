@@ -137,20 +137,23 @@ pub async fn populate_order_history_from_schwab(
     accounts.dedup();
 
     let now = chrono::Utc::now();
-    let start = now - chrono::Duration::hours(24);
+    let start = now - chrono::Duration::days(30);
 
-    for acct in accounts {
+    for acct in &accounts {
         // First attempt: use typed Schwab client
         match api.get_account_orders(acct.clone(), start, now).await {
             Ok(req) => match req.send().await {
                 Ok(orders) => {
                     for order in orders {
-                        // Extract symbol(s) from orderLegCollection
+                        // Extract symbol(s) and instruction from orderLegCollection
                         let order_json = serde_json::to_value(&order).unwrap_or(Value::Null);
-                        if let Some(legs) = order_json.get("orderLegCollection").and_then(|v| v.as_array()) {
-                            for leg in legs {
-                                if let Some(sym) = leg.get("instrument").and_then(|i| i.get("symbol")).and_then(|s| s.as_str()) {
-                                    map.insert(sym.to_string(), chrono::Utc::now());
+                        if let Some(instruction) = order_json.get("instruction").and_then(|v| v.as_str()) {
+                            if let Some(legs) = order_json.get("orderLegCollection").and_then(|v| v.as_array()) {
+                                for leg in legs {
+                                    if let Some(sym) = leg.get("instrument").and_then(|i| i.get("symbol")).and_then(|s| s.as_str()) {
+                                        let key = format!("{}_{}", sym.to_uppercase(), instruction.to_uppercase());
+                                        map.insert(key, chrono::Utc::now());
+                                    }
                                 }
                             }
                         }
@@ -178,21 +181,21 @@ pub async fn populate_order_history_from_schwab(
 }
 
 /// Raw HTTP fallback to query Schwab orders for an account using the bearer token from tokener.
-async fn fetch_schwab_orders_raw(
+/// Returns the raw JSON response string.
+pub async fn fetch_schwab_orders_raw_json(
     tokener: &SharedTokenChecker,
     account_hash: &str,
-) -> Result<HashMap<String, chrono::DateTime<chrono::Utc>>, Box<dyn Error + Send + Sync>> {
-    let mut map = HashMap::new();
+) -> Result<String, Box<dyn Error + Send + Sync>> {
     let token = tokener.get_access_token().await?;
     let client = reqwest::Client::new();
     let now = chrono::Utc::now();
-    let start = now - chrono::Duration::hours(24);
+    let start = now - chrono::Duration::days(30);
 
     // Schwab undocumented endpoint for orders listing (mirror of client call). Use query params for timeframe.
-    let url = format!("https://api.schwabapi.com/trader/v1/accounts/{}/orders?fromDate={}&toDate={}",
+    let url = format!("https://api.schwabapi.com/trader/v1/accounts/{}/orders?fromEnteredTime={}&toEnteredTime={}",
         account_hash,
-        start.to_rfc3339(),
-        now.to_rfc3339()
+        start.format("%Y-%m-%dT%H:%M:%S%.3fZ"),
+        now.format("%Y-%m-%dT%H:%M:%S%.3fZ")
     );
 
     let resp = client
@@ -207,14 +210,50 @@ async fn fetch_schwab_orders_raw(
     }
 
     let body = resp.text().await?;
-    // Parse as JSON and defensively extract symbol strings
+    Ok(body)
+}
+
+/// Raw HTTP fallback to query Schwab orders for an account using the bearer token from tokener.
+async fn fetch_schwab_orders_raw(
+    tokener: &SharedTokenChecker,
+    account_hash: &str,
+) -> Result<HashMap<String, chrono::DateTime<chrono::Utc>>, Box<dyn Error + Send + Sync>> {
+    let mut map = HashMap::new();
+    let token = tokener.get_access_token().await?;
+    let client = reqwest::Client::new();
+    let now = chrono::Utc::now();
+    let start = now - chrono::Duration::days(30);
+
+    // Schwab undocumented endpoint for orders listing (mirror of client call). Use query params for timeframe.
+    let url = format!("https://api.schwabapi.com/trader/v1/accounts/{}/orders?fromEnteredTime={}&toEnteredTime={}",
+        account_hash,
+        start.format("%Y-%m-%dT%H:%M:%S%.3fZ"),
+        now.format("%Y-%m-%dT%H:%M:%S%.3fZ")
+    );
+
+    let resp = client
+        .get(&url)
+        .bearer_auth(token)
+        .header("Accept", "application/json")
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        return Err(format!("Schwab raw orders request failed: {}", resp.status()).into());
+    }
+
+    let body = resp.text().await?;
+    // Parse as JSON and defensively extract symbol + instruction combinations
     let json: serde_json::Value = serde_json::from_str(&body)?;
     if let Some(orders) = json.as_array() {
         for order in orders {
-            if let Some(legs) = order.get("orderLegCollection").and_then(|v| v.as_array()) {
-                for leg in legs {
-                    if let Some(sym) = leg.get("instrument").and_then(|i| i.get("symbol")).and_then(|s| s.as_str()) {
-                        map.insert(sym.to_string(), chrono::Utc::now());
+            if let Some(instruction) = order.get("instruction").and_then(|v| v.as_str()) {
+                if let Some(legs) = order.get("orderLegCollection").and_then(|v| v.as_array()) {
+                    for leg in legs {
+                        if let Some(sym) = leg.get("instrument").and_then(|i| i.get("symbol")).and_then(|s| s.as_str()) {
+                            let key = format!("{}_{}", sym.to_uppercase(), instruction.to_uppercase());
+                            map.insert(key, chrono::Utc::now());
+                        }
                     }
                 }
             }
@@ -223,3 +262,5 @@ async fn fetch_schwab_orders_raw(
 
     Ok(map)
 }
+
+

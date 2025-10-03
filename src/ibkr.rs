@@ -149,9 +149,11 @@ pub async fn populate_order_history_from_ibkr(
                 match item {
                     Ok(ibapi::orders::Executions::ExecutionData(exec)) => {
                         let sym = exec.contract.symbol.as_str().to_string();
-                        // parse exec.execution.time if possible; otherwise use now
+                        // Try to get the side from execution
+                        let side = if exec.execution.shares > 0.0 { "BUY" } else { "SELL" };
+                        let key = format!("{}_{}", sym.to_uppercase(), side);
                         let when = chrono::Utc::now();
-                        result_map.insert(sym, when);
+                        result_map.insert(key, when);
                     }
                     Ok(ibapi::orders::Executions::CommissionReport(_)) => {}
                     Err(e) => {
@@ -175,7 +177,10 @@ pub async fn populate_order_history_from_ibkr(
                     Ok(ibapi::orders::Orders::OrderData(order_data)) => {
                         // OrderData contains contract directly
                         let sym = order_data.contract.symbol.as_str().to_string();
-                        result_map.insert(sym, chrono::Utc::now());
+                        // Try to get action from the order
+                        let action = format!("{:?}", order_data.order.action).to_uppercase();
+                        let key = format!("{}_{}", sym.to_uppercase(), action);
+                        result_map.insert(key, chrono::Utc::now());
                     }
                     Ok(ibapi::orders::Orders::OrderStatus(_)) => {}
                     Ok(ibapi::orders::Orders::Notice(_)) => {}
@@ -199,7 +204,10 @@ pub async fn populate_order_history_from_ibkr(
                     Ok(ibapi::orders::Orders::OrderData(order_data)) => {
                         // Try to extract symbol from order_data.order or contract
                         let sym = order_data.contract.symbol.as_str().to_string();
-                        result_map.insert(sym, chrono::Utc::now());
+                        // Try to get action from the order
+                        let action = format!("{:?}", order_data.order.action).to_uppercase();
+                        let key = format!("{}_{}", sym.to_uppercase(), action);
+                        result_map.insert(key, chrono::Utc::now());
                     }
                     Ok(ibapi::orders::Orders::OrderStatus(_)) => {}
                     Ok(ibapi::orders::Orders::Notice(_)) => {}
@@ -216,4 +224,38 @@ pub async fn populate_order_history_from_ibkr(
     }
 
     Ok(result_map)
+}
+
+/// Fetch open orders from IBKR for status report display
+pub async fn fetch_ib_open_orders(
+    client: &ibapi::Client,
+) -> Result<Vec<ibapi::orders::OrderData>, Box<dyn Error + Send + Sync>> {
+    let mut orders = Vec::new();
+
+    match client.all_open_orders().await {
+        Ok(mut subscription) => {
+            while let Some(item) = subscription.next().await {
+                match item {
+                    Ok(ibapi::orders::Orders::OrderData(order_data)) => {
+                        orders.push(order_data);
+                    }
+                    Ok(ibapi::orders::Orders::OrderStatus(_)) => {
+                        // Status updates for existing orders, skip for now
+                    }
+                    Ok(ibapi::orders::Orders::Notice(_)) => {
+                        // Notices, skip
+                    }
+                    Err(e) => {
+                        eprintln!("Error reading all_open_orders stream: {}", e);
+                        break;
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            return Err(format!("Failed to request IBKR open orders: {}", e).into());
+        }
+    }
+
+    Ok(orders)
 }

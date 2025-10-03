@@ -756,10 +756,10 @@ impl TradingBot {
 
         if let Some(api) = self.api.as_ref() {
             let lookback_end = chrono::Utc::now();
-            let lookback_start = lookback_end - chrono::Duration::hours(24);
+            let lookback_start = lookback_end - chrono::Duration::days(30);
             let mut any_open_orders = false;
 
-            report.push_str("Open Orders (last 24h):\n");
+            report.push_str("Open Orders (last 30 days):\n");
 
             for account_hash in &self.account_hashes {
                 let label = if account_hash.len() > 8 {
@@ -772,6 +772,85 @@ impl TradingBot {
                     account_hash.clone()
                 };
 
+                // Determine API based on symbols configured for this account
+                let account_symbols: Vec<&Symbol> = self.symbols_config.iter()
+                    .filter(|s| s.account_hash == *account_hash)
+                    .collect();
+
+                let uses_ibkr = account_symbols.iter().any(|s| s.api.as_deref() == Some("ibkr"));
+
+                if uses_ibkr {
+                    // For IBKR accounts, fetch open orders from IBKR
+                    if let Some(ref ib_client) = self.ib_client {
+                        match crate::ibkr::fetch_ib_open_orders(ib_client).await {
+                            Ok(ib_orders) => {
+                                let mut account_section = format!("Account {}:\n", label);
+                                let mut account_has_open = false;
+
+                                for order_data in ib_orders {
+                                    let status_label = order_data.order_state.status.clone();
+                                    // Skip filled/cancelled orders
+                                    if matches!(status_label.as_str(), "Filled" | "Cancelled" | "Canceled" | "Expired") {
+                                        continue;
+                                    }
+
+                                    let symbol_text = order_data.contract.symbol.clone();
+                                    let instruction_text = format!("{:?}", order_data.order.action).to_uppercase();
+                                    let qty_value = order_data.order.total_quantity;
+                                    let qty_text = if qty_value.abs() > f64::EPSILON {
+                                        format!("{:.0}", qty_value)
+                                    } else {
+                                        "-".to_string()
+                                    };
+
+                                    let price_text = order_data.order.limit_price
+                                        .filter(|&p| p > 0.0)
+                                        .map(|price| format!(" @ ${:.2}", price))
+                                        .unwrap_or_default();
+
+                                    // IBKR doesn't provide entered time in the same way, use current time as approximation
+                                    let entered_local = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+
+                                    account_section.push_str(&format!(
+                                        "  • #{:<12} {:<12} {:<6} {:>6} {:<8}{} (entered {})",
+                                        order_data.order_id,
+                                        status_label,
+                                        instruction_text,
+                                        qty_text,
+                                        symbol_text,
+                                        price_text,
+                                        entered_local
+                                    ));
+
+                                    account_section.push('\n');
+                                    account_has_open = true;
+                                }
+
+                                if !account_has_open {
+                                    account_section.push_str("  (no open orders)\n");
+                                } else {
+                                    any_open_orders = true;
+                                }
+
+                                report.push_str(&account_section);
+                            }
+                            Err(e) => {
+                                report.push_str(&format!(
+                                    "Account {}:\n  ⚠️ Unable to fetch IBKR orders: {}\n",
+                                    label, e
+                                ));
+                            }
+                        }
+                    } else {
+                        report.push_str(&format!(
+                            "Account {}:\n  ⚠️ IBKR client not connected\n",
+                            label
+                        ));
+                    }
+                    continue;
+                }
+
+                // For Schwab accounts, try to fetch orders with fallback
                 match api
                     .get_account_orders(
                         account_hash.clone(),
@@ -886,11 +965,105 @@ impl TradingBot {
 
                             report.push_str(&account_section);
                         }
-                        Err(err) => {
-                            report.push_str(&format!(
-                                "Account {}:\n  ⚠️ Unable to fetch orders: {}\n",
-                                label, err
-                            ));
+                        Err(e) => {
+                            // Try fallback to raw HTTP like in order history population
+                            // eprintln!("Typed client failed to fetch Schwab orders for status report {}: {} — trying fallback", account_hash, e);
+                            if let Ok(fallback_orders) = crate::schwab::fetch_schwab_orders_raw_json(&self.tokener, &account_hash).await {
+                                let mut account_section = format!("Account {}:\n", label);
+                                let mut account_has_open = false;
+
+                                // Parse the raw orders and filter for open ones
+                                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&fallback_orders) {
+                                    if let Some(orders) = json.as_array() {
+                                        for order in orders {
+                                            let status = order.get("status").and_then(|s| s.as_str()).unwrap_or("");
+                                            let is_closed = matches!(
+                                                status,
+                                                "Filled" | "Cancelled" | "Canceled" | "Expired" | "Rejected" | "Executed" | "Complete" | "Completed"
+                                            );
+
+                                            if is_closed {
+                                                continue;
+                                            }
+
+                                            let mut leg_note = String::new();
+                                            let (symbol_text, instruction_text, qty_value) = order
+                                                .get("orderLegCollection")
+                                                .and_then(|legs| legs.as_array())
+                                                .map(|legs| {
+                                                    if legs.len() > 1 {
+                                                        leg_note = format!(" (+{} legs)", legs.len() - 1);
+                                                    }
+
+                                                    let first_leg = legs.first().cloned().unwrap_or(Value::Null);
+                                                    let symbol = first_leg
+                                                        .get("instrument")
+                                                        .and_then(|inst| inst.get("symbol"))
+                                                        .and_then(|v| v.as_str())
+                                                        .unwrap_or("-")
+                                                        .to_string();
+                                                    let instruction = first_leg
+                                                        .get("instruction")
+                                                        .and_then(|v| v.as_str())
+                                                        .unwrap_or("-")
+                                                        .to_string();
+                                                    let qty = first_leg
+                                                        .get("quantity")
+                                                        .and_then(|v| v.as_f64())
+                                                        .unwrap_or(0.0);
+
+                                                    (symbol, instruction, qty)
+                                                })
+                                                .unwrap_or_else(|| ("-".to_string(), "-".to_string(), 0.0));
+
+                                            let qty_text = if qty_value.abs() > f64::EPSILON {
+                                                format!("{:.0}", qty_value)
+                                            } else {
+                                                "-".to_string()
+                                            };
+
+                                            let price_text = order
+                                                .get("price")
+                                                .and_then(|v| v.as_f64())
+                                                .map(|price| format!(" @ ${:.2}", price))
+                                                .unwrap_or_default();
+
+                                            let entered_time = order
+                                                .get("enteredTime")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("");
+
+                                            account_section.push_str(&format!(
+                                                "  • {:<12} {:<12} {:<6} {:>6} {:<8}{}{} (entered {})",
+                                                order.get("orderId").and_then(|v| v.as_i64()).map(|id| format!("#{}", id)).unwrap_or_else(|| "-".to_string()),
+                                                status,
+                                                instruction_text,
+                                                qty_text,
+                                                symbol_text,
+                                                price_text,
+                                                leg_note,
+                                                entered_time
+                                            ));
+
+                                            account_section.push('\n');
+                                            account_has_open = true;
+                                        }
+                                    }
+                                }
+
+                                if !account_has_open {
+                                    account_section.push_str("  (no open orders)\n");
+                                } else {
+                                    any_open_orders = true;
+                                }
+
+                                report.push_str(&account_section);
+                            } else {
+                                report.push_str(&format!(
+                                    "Account {}:\n  ⚠️ Unable to fetch orders: {}\n",
+                                    label, e
+                                ));
+                            }
                         }
                     },
                     Err(err) => {
@@ -903,7 +1076,7 @@ impl TradingBot {
             }
 
             if !any_open_orders {
-                report.push_str("  (no open orders found in the past 24 hours)\n");
+                report.push_str("  (no open orders found in the past 30 days)\n");
             }
 
             report.push_str("\n");
@@ -1171,24 +1344,25 @@ impl TradingBot {
             .find(|cfg| cfg.account_hash == account_hash && cfg.symbol.eq_ignore_ascii_case(symbol))
             .ok_or("Symbol/account combination not configured")?;
 
-        // Risk check: limit one order per symbol per day
+        // Risk check: limit one order per symbol+side per day
         {
             let mut order_history = self.order_history.lock().await;
             let now = chrono::Utc::now();
             let today = now.date_naive();
+            let history_key = format!("{}_{}", symbol_cfg.symbol.to_uppercase(), side.to_uppercase());
 
-            if let Some(last_order_time) = order_history.get(&symbol_cfg.symbol) {
+            if let Some(last_order_time) = order_history.get(&history_key) {
                 let last_order_date = last_order_time.date_naive();
                 if last_order_date == today {
                     return Err(format!(
-                        "Order blocked: only one order per symbol per day allowed. Last order for {} was on {}",
-                        symbol_cfg.symbol, last_order_date
+                        "Order blocked: only one {} order per symbol per day allowed. Last {} order for {} was on {}",
+                        side, side, symbol_cfg.symbol, last_order_date
                     ).into());
                 }
             }
 
             // Update the order history with current timestamp
-            order_history.insert(symbol_cfg.symbol.to_string(), now);
+            order_history.insert(history_key, now);
         }
 
         // Route based on symbol's api field
@@ -1254,6 +1428,7 @@ impl TradingBot {
                 Ok(mut subscription) => {
                     // Spawn background task to monitor order updates for this order
                     let symbol_name = symbol_cfg.symbol.clone();
+                    let order_side = format!("{:?}", action).to_uppercase();
                     // note: do not rely on the configured account for fills; use the execution's account
                     let account_hash_clone_config = symbol_cfg.account_hash.clone();
                     let positions_map = Arc::clone(&self.positions);
@@ -1271,7 +1446,8 @@ impl TradingBot {
                                     // If order is filled, update order_history timestamp to now
                                     if status.status == "Filled" {
                                         let mut hist = order_history_map.lock().await;
-                                        hist.insert(symbol_name.clone(), chrono::Utc::now());
+                                        let history_key = format!("{}_{}", symbol_name.to_uppercase(), order_side);
+                                        hist.insert(history_key, chrono::Utc::now());
                                     }
                                 }
                                 Ok(ibapi::orders::PlaceOrder::ExecutionData(exec)) => {

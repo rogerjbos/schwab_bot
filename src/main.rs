@@ -4,10 +4,10 @@ use dotenv::dotenv;
 use log;
 
 mod execute_strategy;
-mod trading_bot;
-mod schwab;
 mod ibkr;
 mod models;
+mod schwab;
+mod trading_bot;
 
 use telegram_bot::{BotState, Command, TelegramBotHandler};
 use teloxide::{prelude::*, types::ChatId, update_listeners, utils::command::BotCommands};

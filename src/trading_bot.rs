@@ -11,9 +11,9 @@ use std::{
 
 use telegram_bot::BotState;
 use teloxide::{prelude::*, types::ChatId};
-use tokio::sync::Mutex;
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::Mutex;
 
 // Schwab API imports
 use schwab_api::api::Api;
@@ -22,9 +22,9 @@ use schwab_api::model::market_data::quote_response::QuoteResponse;
 use schwab_api::model::{Instruction, InstrumentRequest, OrderRequest};
 use schwab_api::token::{TokenChecker, Tokener};
 
-use crate::schwab;
 use crate::ibkr;
-use crate::models::{Symbol, PositionSummary, RealTimeQuote, SignalInfo};
+use crate::models::{PositionSummary, RealTimeQuote, SignalInfo, Symbol};
+use crate::schwab;
 
 /// Main trading bot implementation with Schwab API integration.
 pub struct TradingBot {
@@ -140,8 +140,14 @@ impl TradingBot {
         let needs_ib = symbols.iter().any(|s| s.api.as_deref() == Some("ibkr"));
         let ib_client = if needs_ib {
             let host = std::env::var("IBKR_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
-            let port: u16 = std::env::var("IBKR_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(4002);
-            let client_id: i32 = std::env::var("IBKR_CLIENT_ID").ok().and_then(|s| s.parse().ok()).unwrap_or(100);
+            let port: u16 = std::env::var("IBKR_PORT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(4002);
+            let client_id: i32 = std::env::var("IBKR_CLIENT_ID")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(100);
 
             let endpoint = format!("{}:{}", host, port);
 
@@ -152,8 +158,14 @@ impl TradingBot {
 
             // probably won't end up using IBKR market data
             // Optionally request delayed market data for this session
-            if let Err(e) = client.switch_market_data_type(ibapi::market_data::MarketDataType::Delayed).await {
-                eprintln!("Warning: failed to switch market data type to Delayed: {}", e);
+            if let Err(e) = client
+                .switch_market_data_type(ibapi::market_data::MarketDataType::Delayed)
+                .await
+            {
+                eprintln!(
+                    "Warning: failed to switch market data type to Delayed: {}",
+                    e
+                );
             }
 
             Some(Arc::new(client))
@@ -164,10 +176,16 @@ impl TradingBot {
         // If we have an IB client, attempt to pre-populate today's order history from IBKR
         // We'll synchronously fetch today's executions and open/completed orders during init so
         // the in-memory `order_history` prevents duplicate orders across restarts.
-        let mut initial_order_history: HashMap<String, chrono::DateTime<chrono::Utc>> = HashMap::new();
+        let mut initial_order_history: HashMap<String, chrono::DateTime<chrono::Utc>> =
+            HashMap::new();
         // Populate IBKR history first
         if let Some(ref client) = ib_client {
-            match Self::populate_order_history_from_ibkr(client, Arc::new(Mutex::new(HashMap::new()))).await {
+            match Self::populate_order_history_from_ibkr(
+                client,
+                Arc::new(Mutex::new(HashMap::new())),
+            )
+            .await
+            {
                 Ok(map) => initial_order_history.extend(map.into_iter()),
                 Err(e) => eprintln!("Warning: failed to pre-populate IBKR order history: {}", e),
             }
@@ -176,7 +194,10 @@ impl TradingBot {
         // Populate Schwab order history for configured accounts (block on lookup)
         match Self::populate_order_history_from_schwab(&api, &shared_tokener, &symbols).await {
             Ok(map) => initial_order_history.extend(map.into_iter()),
-            Err(e) => eprintln!("Warning: failed to pre-populate Schwab order history: {}", e),
+            Err(e) => eprintln!(
+                "Warning: failed to pre-populate Schwab order history: {}",
+                e
+            ),
         }
 
         Ok(Self {
@@ -198,7 +219,10 @@ impl TradingBot {
     async fn populate_order_history_from_ibkr(
         client: &ibapi::Client,
         _sink: Arc<Mutex<HashMap<String, chrono::DateTime<chrono::Utc>>>>,
-    ) -> Result<HashMap<String, chrono::DateTime<chrono::Utc>>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<
+        HashMap<String, chrono::DateTime<chrono::Utc>>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
         ibkr::populate_order_history_from_ibkr(client).await
     }
 
@@ -207,7 +231,10 @@ impl TradingBot {
         api: &Api<SharedTokenChecker>,
         tokener: &SharedTokenChecker,
         symbols: &Vec<Symbol>,
-    ) -> Result<HashMap<String, chrono::DateTime<chrono::Utc>>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<
+        HashMap<String, chrono::DateTime<chrono::Utc>>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
         schwab::populate_order_history_from_schwab(tokener, api, symbols).await
     }
 
@@ -224,7 +251,8 @@ impl TradingBot {
         &self,
         account_id: &str,
     ) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
-        ibkr::fetch_ib_balance(self, account_id).await
+        let (cash_available, _) = ibkr::fetch_ib_balance(self, account_id).await?;
+        Ok(cash_available)
     }
 
     async fn fetch_positions(
@@ -254,11 +282,15 @@ impl TradingBot {
 
         for account_hash in &self.account_hashes {
             // Determine API based on symbols configured for this account
-            let account_symbols: Vec<&Symbol> = self.symbols_config.iter()
+            let account_symbols: Vec<&Symbol> = self
+                .symbols_config
+                .iter()
                 .filter(|s| s.account_hash == *account_hash)
                 .collect();
 
-            let uses_ibkr = account_symbols.iter().any(|s| s.api.as_deref() == Some("ibkr"));
+            let uses_ibkr = account_symbols
+                .iter()
+                .any(|s| s.api.as_deref() == Some("ibkr"));
 
             if uses_ibkr {
                 // Fetch from IBKR
@@ -268,7 +300,10 @@ impl TradingBot {
                         any_success = true;
                     }
                     Err(err) => {
-                        eprintln!("⚠️ Unable to fetch IBKR balance for {}: {}", account_hash, err);
+                        eprintln!(
+                            "⚠️ Unable to fetch IBKR balance for {}: {}",
+                            account_hash, err
+                        );
                     }
                 }
             } else {
@@ -277,7 +312,10 @@ impl TradingBot {
                         if values.is_empty() {
                             // Empty balance payload
                         } else {
-                            let primary_value = values.get(if values.len() == 3 { 2 } else { 1 }).copied().unwrap_or_else(|| values.last().copied().unwrap_or(0.0));
+                            let primary_value = values
+                                .get(if values.len() == 3 { 2 } else { 1 })
+                                .copied()
+                                .unwrap_or_else(|| values.last().copied().unwrap_or(0.0));
 
                             aggregated_balances.insert(account_hash.clone(), primary_value);
                             any_success = true;
@@ -287,8 +325,8 @@ impl TradingBot {
                         eprintln!("⚠️ Unable to fetch balances for {}: {}", account_hash, err);
                     }
                 }
-                }
             }
+        }
 
         if !any_success {
             return Err(io::Error::new(
@@ -314,11 +352,15 @@ impl TradingBot {
 
         for account_hash in &self.account_hashes.clone() {
             // Determine API based on symbols configured for this account
-            let account_symbols: Vec<&Symbol> = self.symbols_config.iter()
+            let account_symbols: Vec<&Symbol> = self
+                .symbols_config
+                .iter()
                 .filter(|s| s.account_hash == *account_hash)
                 .collect();
 
-            let uses_ibkr = account_symbols.iter().any(|s| s.api.as_deref() == Some("ibkr"));
+            let uses_ibkr = account_symbols
+                .iter()
+                .any(|s| s.api.as_deref() == Some("ibkr"));
 
             if uses_ibkr {
                 // Fetch from IBKR
@@ -328,11 +370,12 @@ impl TradingBot {
                             .entry(account_hash.clone())
                             .or_insert_with(HashMap::new);
                         account_entry.clear();
-                        
+
                         for pos in &position_details {
                             account_entry.insert(pos.symbol.clone(), pos.quantity);
 
-                            if let (Some(market_value), quantity) = (pos.market_value, pos.quantity) {
+                            if let (Some(market_value), quantity) = (pos.market_value, pos.quantity)
+                            {
                                 if quantity.abs() > f64::EPSILON {
                                     let last_price = market_value / quantity.abs();
                                     derived_quotes
@@ -349,7 +392,10 @@ impl TradingBot {
                         any_success = true;
                     }
                     Err(err) => {
-                        eprintln!("⚠️ Unable to fetch IBKR positions for {}: {}", account_hash, err);
+                        eprintln!(
+                            "⚠️ Unable to fetch IBKR positions for {}: {}",
+                            account_hash, err
+                        );
                     }
                 }
             } else {
@@ -363,7 +409,8 @@ impl TradingBot {
                         for pos in &position_details {
                             account_entry.insert(pos.symbol.clone(), pos.quantity);
 
-                            if let (Some(market_value), quantity) = (pos.market_value, pos.quantity) {
+                            if let (Some(market_value), quantity) = (pos.market_value, pos.quantity)
+                            {
                                 if quantity.abs() > f64::EPSILON {
                                     let last_price = market_value / quantity.abs();
                                     derived_quotes
@@ -380,7 +427,10 @@ impl TradingBot {
                         any_success = true;
                     }
                     Err(err) => {
-                        eprintln!("⚠️ Unable to fetch Schwab positions for {}: {}", account_hash, err);
+                        eprintln!(
+                            "⚠️ Unable to fetch Schwab positions for {}: {}",
+                            account_hash, err
+                        );
                     }
                 }
             }
@@ -585,11 +635,15 @@ impl TradingBot {
             report.push_str(&format!("Positions for account {}:\n", label));
 
             // Determine API based on symbols configured for this account
-            let account_symbols: Vec<&Symbol> = self.symbols_config.iter()
+            let account_symbols: Vec<&Symbol> = self
+                .symbols_config
+                .iter()
                 .filter(|s| s.account_hash == *account_hash)
                 .collect();
 
-            let uses_ibkr = account_symbols.iter().any(|s| s.api.as_deref() == Some("ibkr"));
+            let uses_ibkr = account_symbols
+                .iter()
+                .any(|s| s.api.as_deref() == Some("ibkr"));
 
             if uses_ibkr {
                 // For IBKR accounts, try to fetch from IBKR if client is available
@@ -658,8 +712,10 @@ impl TradingBot {
                                 report.push_str(
                                     "-----------------------------------------------------------\n",
                                 );
-                                report
-                                    .push_str(&format!("Total Market Value: ${:.2}\n", total_market_value));
+                                report.push_str(&format!(
+                                    "Total Market Value: ${:.2}\n",
+                                    total_market_value
+                                ));
                                 report.push_str(&format!(
                                     "Total P/L:          ${:.2}\n\n",
                                     total_profit_loss
@@ -667,92 +723,99 @@ impl TradingBot {
                             }
                         }
                         Err(err) => {
-                            report.push_str(&format!("  ⚠️ Unable to fetch IBKR positions: {}\n\n", err));
+                            report.push_str(&format!(
+                                "  ⚠️ Unable to fetch IBKR positions: {}\n\n",
+                                err
+                            ));
                         }
                     }
                 } else {
-                    report.push_str("  ⚠️ IBKR client not connected (missing environment variables)\n\n");
+                    report.push_str(
+                        "  ⚠️ IBKR client not connected (missing environment variables)\n\n",
+                    );
                 }
             } else {
                 // For Schwab accounts, fetch from Schwab API
                 match Self::fetch_positions(&self.tokener, &account_hash).await {
-                Ok(position_details) => {
-                    {
-                        let mut positions_guard = self.positions.lock().await;
-                        let entry = positions_guard
-                            .entry(account_hash.clone())
-                            .or_insert_with(HashMap::new);
-                        entry.clear();
-                        for pos in &position_details {
-                            entry.insert(pos.symbol.clone(), pos.quantity);
+                    Ok(position_details) => {
+                        {
+                            let mut positions_guard = self.positions.lock().await;
+                            let entry = positions_guard
+                                .entry(account_hash.clone())
+                                .or_insert_with(HashMap::new);
+                            entry.clear();
+                            for pos in &position_details {
+                                entry.insert(pos.symbol.clone(), pos.quantity);
+                            }
                         }
-                    }
 
-                    if position_details.is_empty() {
-                        report.push_str("(No Open Positions)\n\n");
-                    } else {
-                        report.push_str("Symbol Qty      AvgPrice MV     Cost   P / L  \n");
-                        report.push_str("------ -------- -------- ------ ------ ------ \n");
+                        if position_details.is_empty() {
+                            report.push_str("(No Open Positions)\n\n");
+                        } else {
+                            report.push_str("Symbol Qty      AvgPrice MV     Cost   P / L  \n");
+                            report.push_str("------ -------- -------- ------ ------ ------ \n");
 
-                        let mut total_market_value = 0.0;
-                        let mut total_profit_loss = 0.0;
+                            let mut total_market_value = 0.0;
+                            let mut total_profit_loss = 0.0;
 
-                        for pos in &position_details {
-                            let side = if pos.is_short { " S" } else { " L" };
-                            let quantity_display = format!("{:.0}{}", pos.quantity, side);
-                            let avg_price = pos
-                                .average_price
-                                .map(|v| format!("{:.2}", v))
-                                .unwrap_or_else(|| "-".to_string());
-                            let market_value = pos
-                                .market_value
-                                .map(|v| {
-                                    total_market_value += v;
-                                    format!("{:.0}", v)
-                                })
-                                .unwrap_or_else(|| "-".to_string());
-                            let cost_basis = pos
-                                .cost_basis
-                                .map(|v| format!("{:.0}", v))
-                                .unwrap_or_else(|| "-".to_string());
-                            let profit_loss = pos
-                                .profit_loss
-                                .map(|v| {
-                                    total_profit_loss += v;
-                                    format!("{:.0}", v)
-                                })
-                                .unwrap_or_else(|| "-".to_string());
+                            for pos in &position_details {
+                                let side = if pos.is_short { " S" } else { " L" };
+                                let quantity_display = format!("{:.0}{}", pos.quantity, side);
+                                let avg_price = pos
+                                    .average_price
+                                    .map(|v| format!("{:.2}", v))
+                                    .unwrap_or_else(|| "-".to_string());
+                                let market_value = pos
+                                    .market_value
+                                    .map(|v| {
+                                        total_market_value += v;
+                                        format!("{:.0}", v)
+                                    })
+                                    .unwrap_or_else(|| "-".to_string());
+                                let cost_basis = pos
+                                    .cost_basis
+                                    .map(|v| format!("{:.0}", v))
+                                    .unwrap_or_else(|| "-".to_string());
+                                let profit_loss = pos
+                                    .profit_loss
+                                    .map(|v| {
+                                        total_profit_loss += v;
+                                        format!("{:.0}", v)
+                                    })
+                                    .unwrap_or_else(|| "-".to_string());
 
-                            let short_symbol: String = pos.symbol.chars().take(5).collect();
+                                let short_symbol: String = pos.symbol.chars().take(5).collect();
 
+                                report.push_str(&format!(
+                                    "{:<6} {:>8} {:>8} {:>6} {:>6} {:>6} \n",
+                                    short_symbol,
+                                    quantity_display,
+                                    avg_price,
+                                    market_value,
+                                    cost_basis,
+                                    profit_loss
+                                ));
+                            }
+
+                            report.push_str(
+                                "-----------------------------------------------------------\n",
+                            );
                             report.push_str(&format!(
-                                "{:<6} {:>8} {:>8} {:>6} {:>6} {:>6} \n",
-                                short_symbol,
-                                quantity_display,
-                                avg_price,
-                                market_value,
-                                cost_basis,
-                                profit_loss
+                                "Total Market Value: ${:.2}\n",
+                                total_market_value
+                            ));
+                            report.push_str(&format!(
+                                "Total P/L:          ${:.2}\n\n",
+                                total_profit_loss
                             ));
                         }
-
-                        report.push_str(
-                            "-----------------------------------------------------------\n",
-                        );
-                        report
-                            .push_str(&format!("Total Market Value: ${:.2}\n", total_market_value));
-                        report.push_str(&format!(
-                            "Total P/L:          ${:.2}\n\n",
-                            total_profit_loss
-                        ));
                     }
-                }
-                Err(err) => {
-                    report.push_str(&format!("  ⚠️ Unable to fetch positions: {}\n\n", err));
+                    Err(err) => {
+                        report.push_str(&format!("  ⚠️ Unable to fetch positions: {}\n\n", err));
+                    }
                 }
             }
         }
-    }
 
         if let Some(api) = self.api.as_ref() {
             let lookback_end = chrono::Utc::now();
@@ -773,11 +836,15 @@ impl TradingBot {
                 };
 
                 // Determine API based on symbols configured for this account
-                let account_symbols: Vec<&Symbol> = self.symbols_config.iter()
+                let account_symbols: Vec<&Symbol> = self
+                    .symbols_config
+                    .iter()
                     .filter(|s| s.account_hash == *account_hash)
                     .collect();
 
-                let uses_ibkr = account_symbols.iter().any(|s| s.api.as_deref() == Some("ibkr"));
+                let uses_ibkr = account_symbols
+                    .iter()
+                    .any(|s| s.api.as_deref() == Some("ibkr"));
 
                 if uses_ibkr {
                     // For IBKR accounts, fetch open orders from IBKR
@@ -790,12 +857,16 @@ impl TradingBot {
                                 for order_data in ib_orders {
                                     let status_label = order_data.order_state.status.clone();
                                     // Skip filled/cancelled orders
-                                    if matches!(status_label.as_str(), "Filled" | "Cancelled" | "Canceled" | "Expired") {
+                                    if matches!(
+                                        status_label.as_str(),
+                                        "Filled" | "Cancelled" | "Canceled" | "Expired"
+                                    ) {
                                         continue;
                                     }
 
                                     let symbol_text = order_data.contract.symbol.clone();
-                                    let instruction_text = format!("{:?}", order_data.order.action).to_uppercase();
+                                    let instruction_text =
+                                        format!("{:?}", order_data.order.action).to_uppercase();
                                     let qty_value = order_data.order.total_quantity;
                                     let qty_text = if qty_value.abs() > f64::EPSILON {
                                         format!("{:.0}", qty_value)
@@ -803,13 +874,17 @@ impl TradingBot {
                                         "-".to_string()
                                     };
 
-                                    let price_text = order_data.order.limit_price
+                                    let price_text = order_data
+                                        .order
+                                        .limit_price
                                         .filter(|&p| p > 0.0)
                                         .map(|price| format!(" @ ${:.2}", price))
                                         .unwrap_or_default();
 
                                     // IBKR doesn't provide entered time in the same way, use current time as approximation
-                                    let entered_local = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                                    let entered_local = chrono::Local::now()
+                                        .format("%Y-%m-%d %H:%M:%S")
+                                        .to_string();
 
                                     account_section.push_str(&format!(
                                         "  • #{:<12} {:<12} {:<6} {:>6} {:<8}{} (entered {})",
@@ -882,7 +957,8 @@ impl TradingBot {
                                     continue;
                                 }
 
-                                let order_json = serde_json::to_value(&order).unwrap_or(Value::Null);
+                                let order_json =
+                                    serde_json::to_value(&order).unwrap_or(Value::Null);
 
                                 let mut leg_note = String::new();
                                 let (symbol_text, instruction_text, qty_value) = order_json
@@ -893,7 +969,8 @@ impl TradingBot {
                                             leg_note = format!(" (+{} legs)", legs.len() - 1);
                                         }
 
-                                        let first_leg = legs.first().cloned().unwrap_or(Value::Null);
+                                        let first_leg =
+                                            legs.first().cloned().unwrap_or(Value::Null);
                                         let symbol = first_leg
                                             .get("instrument")
                                             .and_then(|inst| inst.get("symbol"))
@@ -932,10 +1009,7 @@ impl TradingBot {
                                     .format("%Y-%m-%d %H:%M:%S")
                                     .to_string();
 
-                                let status_desc = order
-                                    .status_description
-                                    .as_deref()
-                                    .unwrap_or("");
+                                let status_desc = order.status_description.as_deref().unwrap_or("");
 
                                 account_section.push_str(&format!(
                                     "  • #{:<12} {:<12} {:<6} {:>6} {:<8}{}{} (entered {})",
@@ -968,18 +1042,36 @@ impl TradingBot {
                         Err(e) => {
                             // Try fallback to raw HTTP like in order history population
                             // eprintln!("Typed client failed to fetch Schwab orders for status report {}: {} — trying fallback", account_hash, e);
-                            if let Ok(fallback_orders) = crate::schwab::fetch_schwab_orders_raw_json(&self.tokener, &account_hash).await {
+                            if let Ok(fallback_orders) =
+                                crate::schwab::fetch_schwab_orders_raw_json(
+                                    &self.tokener,
+                                    &account_hash,
+                                )
+                                .await
+                            {
                                 let mut account_section = format!("Account {}:\n", label);
                                 let mut account_has_open = false;
 
                                 // Parse the raw orders and filter for open ones
-                                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&fallback_orders) {
+                                if let Ok(json) =
+                                    serde_json::from_str::<serde_json::Value>(&fallback_orders)
+                                {
                                     if let Some(orders) = json.as_array() {
                                         for order in orders {
-                                            let status = order.get("status").and_then(|s| s.as_str()).unwrap_or("");
+                                            let status = order
+                                                .get("status")
+                                                .and_then(|s| s.as_str())
+                                                .unwrap_or("");
                                             let is_closed = matches!(
                                                 status,
-                                                "Filled" | "Cancelled" | "Canceled" | "Expired" | "Rejected" | "Executed" | "Complete" | "Completed"
+                                                "Filled"
+                                                    | "Cancelled"
+                                                    | "Canceled"
+                                                    | "Expired"
+                                                    | "Rejected"
+                                                    | "Executed"
+                                                    | "Complete"
+                                                    | "Completed"
                                             );
 
                                             if is_closed {
@@ -992,10 +1084,14 @@ impl TradingBot {
                                                 .and_then(|legs| legs.as_array())
                                                 .map(|legs| {
                                                     if legs.len() > 1 {
-                                                        leg_note = format!(" (+{} legs)", legs.len() - 1);
+                                                        leg_note =
+                                                            format!(" (+{} legs)", legs.len() - 1);
                                                     }
 
-                                                    let first_leg = legs.first().cloned().unwrap_or(Value::Null);
+                                                    let first_leg = legs
+                                                        .first()
+                                                        .cloned()
+                                                        .unwrap_or(Value::Null);
                                                     let symbol = first_leg
                                                         .get("instrument")
                                                         .and_then(|inst| inst.get("symbol"))
@@ -1014,7 +1110,9 @@ impl TradingBot {
 
                                                     (symbol, instruction, qty)
                                                 })
-                                                .unwrap_or_else(|| ("-".to_string(), "-".to_string(), 0.0));
+                                                .unwrap_or_else(|| {
+                                                    ("-".to_string(), "-".to_string(), 0.0)
+                                                });
 
                                             let qty_text = if qty_value.abs() > f64::EPSILON {
                                                 format!("{:.0}", qty_value)
@@ -1158,14 +1256,14 @@ impl TradingBot {
         };
 
         for (symbol, quote) in tracked_symbols {
-            let (action, amount) = match quote.percent_change {
+            let (action, amount, limit_price) = match quote.percent_change {
                 Some(change) if change >= symbol.exit_threshold => {
-                    ("SELL".to_string(), symbol.exit_amount)
+                    ("SELL".to_string(), symbol.exit_amount, quote.last_price.unwrap() * 100.5 / 100.0)
                 }
                 Some(change) if change <= symbol.entry_threshold => {
-                    ("BUY".to_string(), symbol.entry_amount)
+                    ("BUY".to_string(), symbol.entry_amount, quote.last_price.unwrap() * 99.5 / 100.0)
                 }
-                _ => ("HOLD".to_string(), 0.0),
+                _ => ("HOLD".to_string(), 0.0, quote.last_price.unwrap()),  // Changed 0 to 0.0 for f64 consistency
             };
 
             let key = format!("{}@{}", symbol.symbol, symbol.account_hash);
@@ -1184,7 +1282,7 @@ impl TradingBot {
                 key,
                 SignalInfo {
                     action,
-                    last_price: quote.last_price,
+                    last_price: Some(limit_price),
                     quantity,
                 },
             );
@@ -1192,6 +1290,7 @@ impl TradingBot {
 
         signals
     }
+
 
     async fn evaluate_order_risks(
         &self,
@@ -1349,7 +1448,11 @@ impl TradingBot {
             let mut order_history = self.order_history.lock().await;
             let now = chrono::Utc::now();
             let today = now.date_naive();
-            let history_key = format!("{}_{}", symbol_cfg.symbol.to_uppercase(), side.to_uppercase());
+            let history_key = format!(
+                "{}_{}",
+                symbol_cfg.symbol.to_uppercase(),
+                side.to_uppercase()
+            );
 
             if let Some(last_order_time) = order_history.get(&history_key) {
                 let last_order_date = last_order_time.date_naive();
@@ -1446,14 +1549,21 @@ impl TradingBot {
                                     // If order is filled, update order_history timestamp to now
                                     if status.status == "Filled" {
                                         let mut hist = order_history_map.lock().await;
-                                        let history_key = format!("{}_{}", symbol_name.to_uppercase(), order_side);
+                                        let history_key = format!(
+                                            "{}_{}",
+                                            symbol_name.to_uppercase(),
+                                            order_side
+                                        );
                                         hist.insert(history_key, chrono::Utc::now());
                                     }
                                 }
                                 Ok(ibapi::orders::PlaceOrder::ExecutionData(exec)) => {
                                     eprintln!(
                                         "[IBKR Execution] {} {} shares @ {} on {}",
-                                        exec.contract.symbol, exec.execution.shares, exec.execution.price, exec.execution.exchange
+                                        exec.contract.symbol,
+                                        exec.execution.shares,
+                                        exec.execution.price,
+                                        exec.execution.exchange
                                     );
 
                                     // Update cached positions using the execution's account number
@@ -1466,7 +1576,8 @@ impl TradingBot {
                                     let shares = exec.execution.shares;
 
                                     // Persist execution to CSV for auditing
-                                    let exec_csv_line = format!("{},{},{},{},{},{},{}\n",
+                                    let exec_csv_line = format!(
+                                        "{},{},{},{},{},{},{}\n",
                                         chrono::Utc::now().to_rfc3339(),
                                         exec.execution.execution_id,
                                         exec_account,
@@ -1501,19 +1612,28 @@ impl TradingBot {
                                         current_qty - shares
                                     };
 
-                                    account_entry.insert(exec.contract.symbol.as_str().to_string(), new_qty);
+                                    account_entry
+                                        .insert(exec.contract.symbol.as_str().to_string(), new_qty);
                                 }
                                 Ok(ibapi::orders::PlaceOrder::OpenOrder(open_order)) => {
                                     eprintln!(
                                         "[IBKR OpenOrder] {} id {} action {:?} qty {} status {}",
-                                        symbol_name, open_order.order.order_id, open_order.order.action, open_order.order.total_quantity, open_order.order_state.status
+                                        symbol_name,
+                                        open_order.order.order_id,
+                                        open_order.order.action,
+                                        open_order.order.total_quantity,
+                                        open_order.order_state.status
                                     );
                                 }
                                 Ok(ibapi::orders::PlaceOrder::CommissionReport(report)) => {
-                                    eprintln!("[IBKR Commission] {} {}", report.execution_id, report.commission);
+                                    eprintln!(
+                                        "[IBKR Commission] {} {}",
+                                        report.execution_id, report.commission
+                                    );
 
                                     // Persist commission report to CSV
-                                    let comm_csv_line = format!("{},{},{},{}\n",
+                                    let comm_csv_line = format!(
+                                        "{},{},{},{}\n",
                                         chrono::Utc::now().to_rfc3339(),
                                         report.execution_id,
                                         report.commission,
@@ -1530,7 +1650,10 @@ impl TradingBot {
                                     }
                                 }
                                 Ok(ibapi::orders::PlaceOrder::Message(msg)) => {
-                                    eprintln!("[IBKR Order Message] {} - {}", msg.code, msg.message);
+                                    eprintln!(
+                                        "[IBKR Order Message] {} - {}",
+                                        msg.code, msg.message
+                                    );
                                 }
                                 Err(e) => {
                                     eprintln!("Error in IBKR order subscription: {e}");
@@ -1540,7 +1663,10 @@ impl TradingBot {
                         }
                     });
 
-                    eprintln!("✓ IBKR order submitted: {} {} shares @ ${:.2} (order_id {})", side, qty, limit_price, order_id);
+                    eprintln!(
+                        "✓ IBKR order submitted: {} {} shares @ ${:.2} (order_id {})",
+                        side, qty, limit_price, order_id
+                    );
                     return Ok(());
                 }
                 Err(err) => {
@@ -1607,7 +1733,10 @@ impl TradingBot {
                 .send()
                 .await?;
 
-            eprintln!("✓ Schwab order placed: {}@{} {} shares at ${:.2}", symbol, account_hash, qty, rounded_price);
+            eprintln!(
+                "✓ Schwab order placed: {}@{} {} shares at ${:.2}",
+                symbol, account_hash, qty, rounded_price
+            );
             Ok(())
         }
     }
@@ -1620,7 +1749,6 @@ impl TradingBot {
         let symbols: Vec<Symbol> = serde_json::from_str(&content)?;
         Ok(symbols)
     }
-
 }
 
 fn format_int(value: i64) -> String {
@@ -1666,13 +1794,8 @@ impl telegram_bot::TradingBot for TradingBot {
         telegram_bot: Bot,
         chat_id: ChatId,
     ) -> Result<(), Self::Error> {
-        crate::execute_strategy::execute_strategy_internal(
-            self,
-            bot_state,
-            telegram_bot,
-            chat_id,
-        )
-        .await
+        crate::execute_strategy::execute_strategy_internal(self, bot_state, telegram_bot, chat_id)
+            .await
     }
 
     async fn get_status(&self) -> String {

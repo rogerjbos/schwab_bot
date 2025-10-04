@@ -1,6 +1,6 @@
 # Schwab Trading Bot 🤖💼
 
-A Rust-powered trading assistant that connects Schwab brokerage accounts to a Telegram control channel. The bot keeps an eye on configured equities, evaluates momentum signals, enforces strict risk checks, and places limit orders through the official Schwab API. Configuration lives in `symbols_config.json`, letting you tailor exposure, thresholds, and account routing per symbol.
+A Rust-powered trading assistant that connects Schwab (and Interactive Brokers) brokerage accounts to a Telegram control channel. The bot keeps an eye on configured equities, evaluates momentum signals, enforces strict risk checks, and places limit orders through the official Schwab API. Configuration lives in `symbols_config.json`, letting you tailor exposure, thresholds, and account routing per symbol.
 
 ## ✨ Features
 
@@ -48,6 +48,11 @@ A Rust-powered trading assistant that connects Schwab brokerage accounts to a Te
    # Optional overrides
    SCHWAB_ACCOUNT_HASH=account_hash_if_you_have_multiple
    RUST_LOG=info
+
+   # IBKR (optional)
+   IBKR_HOST="127.0.0.1"
+   IBKR_PORT="4002"
+   IBKR_CLIENT_ID="0"
    ```
 
 4. **Authorize with Schwab (first run only)**
@@ -58,14 +63,25 @@ A Rust-powered trading assistant that connects Schwab brokerage accounts to a Te
 5. **Configure tracked symbols**
    - Edit `symbols_config.json` with entries like:
      ```json
-     {
-       "symbol": "URNM",
-       "entry_amount": 100.0,
-       "exit_amount": 100.0,
-       "entry_threshold": -1.0,
-       "exit_threshold": 2.1,
-       "account_hash": "<your_account_hash>"
-     }
+      [
+      {
+         "symbol": "VTI",
+         "account_hash": "YOUR_SCHWAB_ACCOUNT_HASH (not the account number)",
+         "entry_amount": 1000,
+         "exit_amount": 1000,
+         "entry_threshold": -0.02,
+         "exit_threshold": 0.02
+      },
+      {
+         "symbol": "AAPL",
+         "api": "ibkr",
+         "account_hash": "YOUR_IBKR_ACCOUNT_NUMBER (no hash needed for ibapi)",
+         "entry_amount": 500,
+         "exit_amount": 500,
+         "entry_threshold": -0.01,
+         "exit_threshold": 0.01
+      }
+      ]
      ```
    - `entry_amount` / `exit_amount` are USD notionals the bot converts to share quantity using the latest price.
    - Thresholds represent percent change triggers based on Schwab quote data.

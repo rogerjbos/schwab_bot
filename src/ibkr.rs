@@ -1,15 +1,18 @@
-use std::collections::HashMap;
-use std::error::Error;
 use crate::models::PositionSummary;
 use ibapi::orders::ExecutionFilter;
+use ibapi::accounts::{types::AccountId, AccountUpdate};
+use std::collections::HashMap;
+use std::error::Error;
 
 pub async fn fetch_ib_positions(
     owner: &crate::trading_bot::TradingBot,
     account_id: &str,
-    ) -> Result<Vec<PositionSummary>, Box<dyn Error + Send + Sync>> {
-    let ib_client = owner.ib_client.as_ref().ok_or("IB client not initialized")?.clone();
-
-    use ibapi::accounts::{types::AccountId, AccountUpdate};
+) -> Result<Vec<PositionSummary>, Box<dyn Error + Send + Sync>> {
+    let ib_client = owner
+        .ib_client
+        .as_ref()
+        .ok_or("IB client not initialized")?
+        .clone();
 
     let account = AccountId::from(account_id);
     let mut subscription = ib_client.account_updates(&account).await?;
@@ -53,17 +56,17 @@ pub async fn fetch_ib_positions(
 
                 positions.insert(
                     symbol.clone(),
-                        PositionSummary {
-                            symbol,
-                            description,
-                            asset_type,
-                            quantity,
-                            is_short,
-                            average_price,
-                            market_value,
-                            cost_basis,
-                            profit_loss,
-                        },
+                    PositionSummary {
+                        symbol,
+                        description,
+                        asset_type,
+                        quantity,
+                        is_short,
+                        average_price,
+                        market_value,
+                        cost_basis,
+                        profit_loss,
+                    },
                 );
             }
             Ok(AccountUpdate::End) => {
@@ -88,8 +91,12 @@ pub async fn fetch_ib_positions(
 pub async fn fetch_ib_balance(
     owner: &crate::trading_bot::TradingBot,
     account_id: &str,
-) -> Result<f64, Box<dyn Error + Send + Sync>> {
-    let ib_client = owner.ib_client.as_ref().ok_or("IB client not initialized")?.clone();
+) -> Result<(f64, f64), Box<dyn Error + Send + Sync>> {  // Updated return type: (cash_available, liquidation_value)
+    let ib_client = owner
+        .ib_client
+        .as_ref()
+        .ok_or("IB client not initialized")?
+        .clone();
 
     use ibapi::accounts::{types::AccountId, AccountUpdate};
 
@@ -123,6 +130,7 @@ pub async fn fetch_ib_balance(
         }
     }
 
+    // Ensure we have at least one value; otherwise, return an error
     if net_liquidation.is_none() && total_cash.is_none() {
         subscription.cancel().await;
         return Err(std::io::Error::new(
@@ -132,9 +140,12 @@ pub async fn fetch_ib_balance(
         .into());
     }
 
-    let balance_value = net_liquidation.or(total_cash).unwrap_or(0.0);
-    Ok(balance_value)
+    // Return both values as a tuple: (cash_available, liquidation_value)
+    let cash_available = total_cash.unwrap_or(0.0);
+    let liquidation_value = net_liquidation.unwrap_or(0.0);
+    Ok((cash_available, liquidation_value))
 }
+
 
 pub async fn populate_order_history_from_ibkr(
     client: &ibapi::Client,
@@ -150,7 +161,11 @@ pub async fn populate_order_history_from_ibkr(
                     Ok(ibapi::orders::Executions::ExecutionData(exec)) => {
                         let sym = exec.contract.symbol.as_str().to_string();
                         // Try to get the side from execution
-                        let side = if exec.execution.shares > 0.0 { "BUY" } else { "SELL" };
+                        let side = if exec.execution.shares > 0.0 {
+                            "BUY"
+                        } else {
+                            "SELL"
+                        };
                         let key = format!("{}_{}", sym.to_uppercase(), side);
                         let when = chrono::Utc::now();
                         result_map.insert(key, when);

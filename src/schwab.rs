@@ -1,5 +1,5 @@
-use crate::trading_bot::SharedTokenChecker;
 use crate::models::{PositionSummary, Symbol};
+use crate::trading_bot::SharedTokenChecker;
 use schwab_api::token::Tokener;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -11,7 +11,8 @@ pub async fn fetch_positions_schwab(
 ) -> Result<Vec<PositionSummary>, Box<dyn Error + Send + Sync>> {
     let access_token = tokener.get_access_token().await?;
     let client = reqwest::Client::new();
-    let url = format!("https://api.schwabapi.com/trader/v1/accounts/{account_hash}?fields=positions");
+    let url =
+        format!("https://api.schwabapi.com/trader/v1/accounts/{account_hash}?fields=positions");
 
     let response = client
         .get(url)
@@ -147,11 +148,24 @@ pub async fn populate_order_history_from_schwab(
                     for order in orders {
                         // Extract symbol(s) and instruction from orderLegCollection
                         let order_json = serde_json::to_value(&order).unwrap_or(Value::Null);
-                        if let Some(instruction) = order_json.get("instruction").and_then(|v| v.as_str()) {
-                            if let Some(legs) = order_json.get("orderLegCollection").and_then(|v| v.as_array()) {
+                        if let Some(instruction) =
+                            order_json.get("instruction").and_then(|v| v.as_str())
+                        {
+                            if let Some(legs) = order_json
+                                .get("orderLegCollection")
+                                .and_then(|v| v.as_array())
+                            {
                                 for leg in legs {
-                                    if let Some(sym) = leg.get("instrument").and_then(|i| i.get("symbol")).and_then(|s| s.as_str()) {
-                                        let key = format!("{}_{}", sym.to_uppercase(), instruction.to_uppercase());
+                                    if let Some(sym) = leg
+                                        .get("instrument")
+                                        .and_then(|i| i.get("symbol"))
+                                        .and_then(|s| s.as_str())
+                                    {
+                                        let key = format!(
+                                            "{}_{}",
+                                            sym.to_uppercase(),
+                                            instruction.to_uppercase()
+                                        );
                                         map.insert(key, chrono::Utc::now());
                                     }
                                 }
@@ -169,7 +183,10 @@ pub async fn populate_order_history_from_schwab(
             },
             Err(e) => {
                 // Possibly invalid account number (Schwab client may surface ServiceError). Try fallback.
-                eprintln!("Typed request error for Schwab account {}: {} — falling back to raw HTTP", acct, e);
+                eprintln!(
+                    "Typed request error for Schwab account {}: {} — falling back to raw HTTP",
+                    acct, e
+                );
                 if let Ok(fallback_map) = fetch_schwab_orders_raw(tokener, &acct).await {
                     map.extend(fallback_map.into_iter());
                 }
@@ -250,8 +267,13 @@ async fn fetch_schwab_orders_raw(
             if let Some(instruction) = order.get("instruction").and_then(|v| v.as_str()) {
                 if let Some(legs) = order.get("orderLegCollection").and_then(|v| v.as_array()) {
                     for leg in legs {
-                        if let Some(sym) = leg.get("instrument").and_then(|i| i.get("symbol")).and_then(|s| s.as_str()) {
-                            let key = format!("{}_{}", sym.to_uppercase(), instruction.to_uppercase());
+                        if let Some(sym) = leg
+                            .get("instrument")
+                            .and_then(|i| i.get("symbol"))
+                            .and_then(|s| s.as_str())
+                        {
+                            let key =
+                                format!("{}_{}", sym.to_uppercase(), instruction.to_uppercase());
                             map.insert(key, chrono::Utc::now());
                         }
                     }
@@ -262,5 +284,3 @@ async fn fetch_schwab_orders_raw(
 
     Ok(map)
 }
-
-

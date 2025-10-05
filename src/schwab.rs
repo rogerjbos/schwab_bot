@@ -115,7 +115,7 @@ pub async fn get_balance_schwab(
                 ]);
             }
         }
-    }
+    } 
 
     // Return empty vec if no balances found
     Ok(vec![])

@@ -79,7 +79,7 @@ impl Tokener for SharedTokenChecker {
 
 impl TradingBot {
     /// Creates a new instance of the TradingBot with Schwab API integration.
-    pub async fn new() -> Result<Self, Box<dyn Error + Send + Sync>> {
+    pub async fn new(_interval_seconds: u64) -> Result<Self, Box<dyn Error + Send + Sync>> {
         // Read Schwab API credentials from environment
         let key = std::env::var("SCHWAB_API_KEY")?;
         let secret = std::env::var("SCHWAB_API_SECRET")?;
@@ -566,8 +566,10 @@ impl TradingBot {
 
         report.push_str("Balance Summary:\n");
         let mut balance_snapshot = HashMap::new();
+        let mut cash_snapshot = HashMap::new();
         if let Some(api) = self.api.as_ref() {
             let mut temp_balance_snapshot = HashMap::new();
+            let mut temp_cash_snapshot = HashMap::new();
 
             for account_hash in &self.account_hashes {
                 let label = if account_hash.len() > 8 {
@@ -593,12 +595,14 @@ impl TradingBot {
                             balances[1]
                         ));
                         temp_balance_snapshot.insert(account_hash.clone(), balances[1]);
+                        temp_cash_snapshot.insert(account_hash.clone(), balances[0]);
                     }
                     Ok(balances) if balances.len() == 3 => {
                         report.push_str(&format!("Available Funds: ${:.2}\n", balances[0]));
                         report.push_str(&format!("Buying Power:    ${:.2}\n", balances[1]));
                         report.push_str(&format!("Equity:          ${:.2}\n", balances[2]));
                         temp_balance_snapshot.insert(account_hash.clone(), balances[2]);
+                        temp_cash_snapshot.insert(account_hash.clone(), balances[0]);
                     }
                     Ok(other) => {
                         report.push_str("⚠️ Received unexpected balance payload from Schwab.\n");
@@ -618,6 +622,7 @@ impl TradingBot {
                 let mut balances_guard = self.account_balances.lock().await;
                 *balances_guard = temp_balance_snapshot.clone();
                 balance_snapshot = temp_balance_snapshot;
+                cash_snapshot = temp_cash_snapshot;
             }
         } else {
             report.push_str("  ⚠️ Schwab API client not initialized.\n\n");
@@ -647,6 +652,17 @@ impl TradingBot {
                 .iter()
                 .any(|s| s.api.as_deref() == Some("ibkr"));
 
+            let cash = if uses_ibkr {
+                if let Ok(cash_val) = self.fetch_ib_balance(&account_hash).await {
+                    cash_val
+                } else {
+                    0.0
+                }
+            } else {
+                cash_snapshot.get(&account_hash).copied().unwrap_or(0.0)
+            };
+            cash_snapshot.insert(account_hash.clone(), cash);
+
             if uses_ibkr {
                 // For IBKR accounts, try to fetch from IBKR if client is available
                 if self.ib_client.is_some() {
@@ -666,15 +682,22 @@ impl TradingBot {
                             if position_details.is_empty() {
                                 report.push_str("(No Open Positions)\n\n");
                             } else {
-                                report.push_str("Symbol Qty      AvgPrice MV     Cost   P / L  Weight \n");
-                                report.push_str("------ -------- -------- ------ ------ ------ ------ \n");
-
+                                // First pass to calculate totals
                                 let mut total_market_value = 0.0;
                                 let mut total_profit_loss = 0.0;
-
-                                // Calculate total portfolio value (holdings + cash)
-                                let total_portfolio_value = balance_snapshot.get(&account_hash).copied().unwrap_or(0.0);
-
+                                for pos in &position_details {
+                                    if let Some(mv) = pos.market_value {
+                                        total_market_value += mv;
+                                    }
+                                    if let Some(pl) = pos.profit_loss {
+                                        total_profit_loss += pl;
+                                    }
+                                }
+                                let portfolio_total = cash + total_market_value;
+                                balance_snapshot.insert(account_hash.clone(), portfolio_total);
+                                // Then, the table
+                                report.push_str("Symbol Qty      AvgPrice MV     Cost   P / L  Weight \n");
+                                report.push_str("------ -------- -------- ------ ------ ------ ------ \n");
                                 for pos in &position_details {
                                     let side = if pos.is_short { " S" } else { " L" };
                                     let quantity_display = format!("{:.0}{}", pos.quantity, side);
@@ -684,36 +707,27 @@ impl TradingBot {
                                         .unwrap_or_else(|| "-".to_string());
                                     let market_value = pos
                                         .market_value
-                                        .map(|v| {
-                                            total_market_value += v;
-                                            format!("{:.0}", v)
-                                        })
+                                        .map(|v| format_currency(v))
                                         .unwrap_or_else(|| "-".to_string());
                                     let cost_basis = pos
                                         .cost_basis
-                                        .map(|v| format!("{:.0}", v))
+                                        .map(|v| format_currency(v))
                                         .unwrap_or_else(|| "-".to_string());
                                     let profit_loss = pos
                                         .profit_loss
-                                        .map(|v| {
-                                            total_profit_loss += v;
-                                            format!("{:.0}", v)
-                                        })
+                                        .map(|v| format_currency(v))
                                         .unwrap_or_else(|| "-".to_string());
-
                                     // Calculate position weight
                                     let weight = if let Some(mv) = pos.market_value {
-                                        if total_portfolio_value > 0.0 {
-                                            format!("{:.1}%", (mv / total_portfolio_value) * 100.0)
+                                        if portfolio_total > 0.0 {
+                                            format!("{:.1}%", (mv / portfolio_total) * 100.0)
                                         } else {
                                             "-".to_string()
                                         }
                                     } else {
                                         "-".to_string()
                                     };
-
                                     let short_symbol: String = pos.symbol.chars().take(5).collect();
-
                                     report.push_str(&format!(
                                         "{:<6} {:>8} {:>8} {:>6} {:>6} {:>6} {:>6} \n",
                                         short_symbol,
@@ -725,17 +739,11 @@ impl TradingBot {
                                         weight
                                     ));
                                 }
-
-                                report.push_str(
-                                    "-----------------------------------------------------------\n",
-                                );
+                                // Summary
+                                let pnl_icon = if total_profit_loss >= 0.0 { "📈" } else { "📉" };
                                 report.push_str(&format!(
-                                    "Total Market Value: ${:.2}\n",
-                                    total_market_value
-                                ));
-                                report.push_str(&format!(
-                                    "Total P/L:          ${:.2}\n\n",
-                                    total_profit_loss
+                                    "\n💰 ${:.2}  💼 ${:.2}  🏦 ${:.2}  {} ${:.2}\n\n",
+                                    cash, total_market_value, portfolio_total, pnl_icon, total_profit_loss
                                 ));
                             }
                         }
@@ -769,15 +777,22 @@ impl TradingBot {
                         if position_details.is_empty() {
                             report.push_str("(No Open Positions)\n\n");
                         } else {
-                            report.push_str("Symbol Qty      AvgPrice MV     Cost   P / L  Weight \n");
-                            report.push_str("------ -------- -------- ------ ------ ------ ------ \n");
-
+                            // First pass to calculate totals
                             let mut total_market_value = 0.0;
                             let mut total_profit_loss = 0.0;
-
-                            // Calculate total portfolio value (holdings + cash)
-                            let total_portfolio_value = balance_snapshot.get(&account_hash).copied().unwrap_or(0.0);
-
+                            for pos in &position_details {
+                                if let Some(mv) = pos.market_value {
+                                    total_market_value += mv;
+                                }
+                                if let Some(pl) = pos.profit_loss {
+                                    total_profit_loss += pl;
+                                }
+                            }
+                            let portfolio_total = cash + total_market_value;
+                            balance_snapshot.insert(account_hash.clone(), portfolio_total);
+                            // Then, the table
+                            report.push_str("Symbol Qty      AvgPrice MV     Cost   P / L  Weight \n");
+                            report.push_str("------ -------- -------- ------ ------ ------ ------ \n");
                             for pos in &position_details {
                                 let side = if pos.is_short { " S" } else { " L" };
                                 let quantity_display = format!("{:.0}{}", pos.quantity, side);
@@ -787,36 +802,27 @@ impl TradingBot {
                                     .unwrap_or_else(|| "-".to_string());
                                 let market_value = pos
                                     .market_value
-                                    .map(|v| {
-                                        total_market_value += v;
-                                        format!("{:.0}", v)
-                                    })
+                                    .map(|v| format_currency(v))
                                     .unwrap_or_else(|| "-".to_string());
                                 let cost_basis = pos
                                     .cost_basis
-                                    .map(|v| format!("{:.0}", v))
+                                    .map(|v| format_currency(v))
                                     .unwrap_or_else(|| "-".to_string());
                                 let profit_loss = pos
                                     .profit_loss
-                                    .map(|v| {
-                                        total_profit_loss += v;
-                                        format!("{:.0}", v)
-                                    })
+                                    .map(|v| format_currency(v))
                                     .unwrap_or_else(|| "-".to_string());
-
                                 // Calculate position weight
                                 let weight = if let Some(mv) = pos.market_value {
-                                    if total_portfolio_value > 0.0 {
-                                        format!("{:.1}%", (mv / total_portfolio_value) * 100.0)
+                                    if portfolio_total > 0.0 {
+                                        format!("{:.1}%", (mv / portfolio_total) * 100.0)
                                     } else {
                                         "-".to_string()
                                     }
                                 } else {
                                     "-".to_string()
                                 };
-
                                 let short_symbol: String = pos.symbol.chars().take(5).collect();
-
                                 report.push_str(&format!(
                                     "{:<6} {:>8} {:>8} {:>6} {:>6} {:>6} {:>6} \n",
                                     short_symbol,
@@ -828,17 +834,11 @@ impl TradingBot {
                                     weight
                                 ));
                             }
-
-                            report.push_str(
-                                "-----------------------------------------------------------\n",
-                            );
+                            // Summary
+                            let pnl_icon = if total_profit_loss >= 0.0 { "📈" } else { "📉" };
                             report.push_str(&format!(
-                                "Total Market Value: ${:.2}\n",
-                                total_market_value
-                            ));
-                            report.push_str(&format!(
-                                "Total P/L:          ${:.2}\n\n",
-                                total_profit_loss
+                                "\n💰 ${:.2}  💼 ${:.2}  🏦 ${:.2}  {} ${:.2}\n\n",
+                                cash, total_market_value, portfolio_total, pnl_icon, total_profit_loss
                             ));
                         }
                     }
@@ -854,7 +854,7 @@ impl TradingBot {
             let lookback_start = lookback_end - chrono::Duration::days(30);
             let mut any_open_orders = false;
 
-            report.push_str("Open Orders (last 30 days):\n");
+            report.push_str("Recent Orders (last 30 days):\n");
 
             for account_hash in &self.account_hashes {
                 let label = if account_hash.len() > 8 {
@@ -898,7 +898,7 @@ impl TradingBot {
 
                                     let symbol_text = order_data.contract.symbol.clone();
                                     let instruction_text =
-                                        format!("{:?}", order_data.order.action).to_uppercase();
+                                        format!("{:?}", order_data.order.action).chars().next().unwrap_or('?').to_string();
                                     let qty_value = order_data.order.total_quantity;
                                     let qty_text = if qty_value.abs() > f64::EPSILON {
                                         format!("{:.0}", qty_value)
@@ -915,18 +915,18 @@ impl TradingBot {
 
                                     // IBKR doesn't provide entered time in the same way, use current time as approximation
                                     let entered_local = chrono::Local::now()
-                                        .format("%Y-%m-%d %H:%M:%S")
+                                        .format("%m-%d")
                                         .to_string();
 
                                     account_section.push_str(&format!(
-                                        "  • #{:<12} {:<12} {:<6} {:>6} {:<8}{} (entered {})",
-                                        order_data.order_id,
-                                        status_label,
+                                        "• {:5} {:<1} {:<6} {:>6} {:<5} {} {}",
+                                        symbol_text,
                                         instruction_text,
                                         qty_text,
-                                        symbol_text,
                                         price_text,
-                                        entered_local
+                                        status_label,
+                                        entered_local,
+                                        order_data.order_id
                                     ));
 
                                     account_section.push('\n');
@@ -934,7 +934,7 @@ impl TradingBot {
                                 }
 
                                 if !account_has_open {
-                                    account_section.push_str("  (no open orders)\n");
+                                    account_section.push_str("(no open orders)\n");
                                 } else {
                                     any_open_orders = true;
                                 }
@@ -1038,21 +1038,20 @@ impl TradingBot {
                                 let entered_local = order
                                     .entered_time
                                     .with_timezone(&chrono::Local)
-                                    .format("%Y-%m-%d %H:%M:%S")
+                                    .format("%m-%d")
                                     .to_string();
 
                                 let status_desc = order.status_description.as_deref().unwrap_or("");
 
                                 account_section.push_str(&format!(
-                                    "  • #{:<12} {:<12} {:<6} {:>6} {:<8}{}{} (entered {})",
-                                    order.order_id,
-                                    status_label,
+                                    "• {:5} {:<1} {:<6} {:>6} {:<5} {} {}",
+                                    symbol_text,
                                     instruction_text,
                                     qty_text,
-                                    symbol_text,
                                     price_text,
-                                    leg_note,
-                                    entered_local
+                                    status_label,
+                                    entered_local,
+                                    order.order_id
                                 ));
 
                                 if !status_desc.is_empty() {
@@ -1232,14 +1231,14 @@ impl TradingBot {
         };
 
         if !tracked_symbols.is_empty() {
-            report.push_str("Tracked Symbols (regular session):\n");
-            report.push_str("Symbol   Signal  Last    %Chg    Volume        Avg 10D Vol\n");
-            report.push_str("-------- ------ -------- ------- ------------ -------------\n");
+            report.push_str("Tracked Symbols:\n");
+            report.push_str("Symbol S Last  %Chg  Volume 10DVol\n");
+            report.push_str("------ - ----- ----- ------ ------\n");
             for (symbol_cfg, quote) in tracked_symbols {
                 let signal = match quote.percent_change {
-                    Some(change) if change >= symbol_cfg.exit_threshold => "SELL",
-                    Some(change) if change <= symbol_cfg.entry_threshold => "BUY",
-                    _ => "HOLD",
+                    Some(change) if change >= symbol_cfg.exit_threshold => "S",
+                    Some(change) if change <= symbol_cfg.entry_threshold => "B",
+                    _ => "H",
                 };
                 let last = quote
                     .last_price
@@ -1247,21 +1246,21 @@ impl TradingBot {
                     .unwrap_or_else(|| "-".to_string());
                 let pct = quote
                     .percent_change
-                    .map(|v| format!("{:+.2}%", v))
+                    .map(|v| format!("{:+.1}%", v))
                     .unwrap_or_else(|| "-".to_string());
                 let volume = quote
                     .total_volume
-                    .map(|v| format_int(v.round() as i64))
+                    .map(|v| format_int((v / 1000.0) as i64))
                     .unwrap_or_else(|| "-".to_string());
                 let avg_volume = quote
                     .avg_10_day_volume
-                    .map(|v| format_int(v.round() as i64))
+                    .map(|v| format_int((v / 1000.0) as i64))
                     .unwrap_or_else(|| "-".to_string());
 
                 let short_symbol: String = symbol_cfg.symbol.chars().take(5).collect();
 
                 report.push_str(&format!(
-                    "{:<8} {:>6} {:>8} {:>7} {:>12} {:>13}\n",
+                    "{:<6} {:>2} {:>6} {:>6} {:>6} {:>6}\n",
                     short_symbol, signal, last, pct, volume, avg_volume
                 ));
             }
@@ -1868,16 +1867,25 @@ fn format_int(value: i64) -> String {
     }
 }
 
+fn format_currency(value: f64) -> String {
+    if value.abs() >= 10000.0 {
+        let thousands = value / 1000.0;
+        format!("{:.1}K", thousands)
+    } else {
+        format!("{:.0}", value)
+    }
+}
+
 // Implement the telegram_bot::TradingBot trait for our TradingBot
 #[async_trait]
 impl telegram_bot::TradingBot for TradingBot {
     type Error = Box<dyn std::error::Error + Send + Sync>;
 
-    async fn new() -> Result<Self, Self::Error>
+    async fn new(interval_seconds: u64) -> Result<Self, Self::Error>
     where
         Self: Sized,
     {
-        Self::new().await
+        Self::new(interval_seconds).await
     }
 
     async fn execute_strategy(
@@ -1888,96 +1896,5 @@ impl telegram_bot::TradingBot for TradingBot {
     ) -> Result<(), Self::Error> {
         crate::execute_strategy::execute_strategy_internal(self, bot_state, telegram_bot, chat_id)
             .await
-    }
-
-    async fn get_status(&self) -> String {
-        let positions = self.positions.lock().await;
-        let balances = self.account_balances.lock().await;
-        let prices = self.real_time_prices.lock().await;
-
-        let mut status = String::from("Schwab Trading Bot Status:\n\n");
-
-        if balances.is_empty() {
-            status.push_str("Account Balances:\n  (not available)\n\n");
-        } else {
-            status.push_str("Account Balances:\n");
-            for (account_hash, balance) in balances.iter() {
-                let label = if account_hash.len() > 8 {
-                    format!(
-                        "{}…{}",
-                        &account_hash[..4],
-                        &account_hash[account_hash.len() - 4..]
-                    )
-                } else {
-                    account_hash.clone()
-                };
-                status.push_str(&format!("  {}: ${:.2}\n", label, balance));
-            }
-            status.push_str("\n");
-        }
-
-        status.push_str("Positions:\n");
-        if positions.is_empty() {
-            status.push_str("  (no cached positions)\n");
-        } else {
-            for (account_hash, account_positions) in positions.iter() {
-                let label = if account_hash.len() > 8 {
-                    format!(
-                        "{}…{}",
-                        &account_hash[..4],
-                        &account_hash[account_hash.len() - 4..]
-                    )
-                } else {
-                    account_hash.clone()
-                };
-
-                status.push_str(&format!("  Account {}:\n", label));
-
-                if account_positions.is_empty() {
-                    status.push_str("    (no open positions)\n");
-                } else {
-                    for (symbol, position) in account_positions.iter() {
-                        let current_price = prices
-                            .get(symbol)
-                            .and_then(|quote| quote.last_price)
-                            .unwrap_or(0.0);
-                        status.push_str(&format!(
-                            "    {}: {:.4} units @ ${:.2}\n",
-                            symbol, position, current_price
-                        ));
-                    }
-                }
-            }
-        }
-
-        status.push_str("\nTracked Symbols:\n");
-        let mut seen = HashSet::new();
-        for symbol in &self.symbols_config {
-            if seen.insert(symbol.symbol.clone()) {
-                let quote = prices.get(&symbol.symbol);
-                let current_price = quote
-                    .and_then(|q| q.last_price)
-                    .map(|p| format!("${:.2}", p))
-                    .unwrap_or_else(|| "-".to_string());
-                let percent_change = quote
-                    .and_then(|q| q.percent_change)
-                    .map(|p| format!("{:+.2}%", p))
-                    .unwrap_or_else(|| "-".to_string());
-                status.push_str(&format!(
-                    "  {}: {} ({})\n",
-                    symbol.symbol, current_price, percent_change
-                ));
-            }
-        }
-
-        status
-    }
-
-    fn get_config_path(&self) -> &str {
-        "/Users/rogerbos/rust_home/schwab_bot/symbols_config.json"
-    }
-
-    fn get_interval_seconds(&self) -> u64 {
-        60 // in seconds
     }
 }

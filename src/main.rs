@@ -1,3 +1,5 @@
+const INTERVAL_SECONDS: u64 = 30;
+
 use std::{error::Error, sync::Arc};
 
 use dotenv::dotenv;
@@ -55,11 +57,19 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // Start the trading bot logic (no restart loop)
     let bot_state_clone = Arc::clone(&schwab_bot_state);
     let tg_bot_clone = tg_bot.clone();
+    
+    // Get interval from environment or use default
+    let interval_seconds = std::env::var("SCHWAB_BOT_INTERVAL_SECONDS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(INTERVAL_SECONDS);
+    
     TelegramBotHandler::init_and_run_bot::<TradingBot>(
         bot_state_clone,
         tg_bot_clone,
         chat_id,
         request_rx,
+        interval_seconds,
     )
     .await?;
 

@@ -565,8 +565,9 @@ impl TradingBot {
         }
 
         report.push_str("Balance Summary:\n");
+        let mut balance_snapshot = HashMap::new();
         if let Some(api) = self.api.as_ref() {
-            let mut balance_snapshot = HashMap::new();
+            let mut temp_balance_snapshot = HashMap::new();
 
             for account_hash in &self.account_hashes {
                 let label = if account_hash.len() > 8 {
@@ -591,18 +592,18 @@ impl TradingBot {
                             "Liquidation Value:           ${:.2}\n",
                             balances[1]
                         ));
-                        balance_snapshot.insert(account_hash.clone(), balances[1]);
+                        temp_balance_snapshot.insert(account_hash.clone(), balances[1]);
                     }
                     Ok(balances) if balances.len() == 3 => {
                         report.push_str(&format!("Available Funds: ${:.2}\n", balances[0]));
                         report.push_str(&format!("Buying Power:    ${:.2}\n", balances[1]));
                         report.push_str(&format!("Equity:          ${:.2}\n", balances[2]));
-                        balance_snapshot.insert(account_hash.clone(), balances[2]);
+                        temp_balance_snapshot.insert(account_hash.clone(), balances[2]);
                     }
                     Ok(other) => {
                         report.push_str("⚠️ Received unexpected balance payload from Schwab.\n");
                         if let Some(last) = other.last() {
-                            balance_snapshot.insert(account_hash.clone(), *last);
+                            temp_balance_snapshot.insert(account_hash.clone(), *last);
                         }
                     }
                     Err(err) => {
@@ -613,9 +614,10 @@ impl TradingBot {
                 report.push_str("\n");
             }
 
-            if !balance_snapshot.is_empty() {
+            if !temp_balance_snapshot.is_empty() {
                 let mut balances_guard = self.account_balances.lock().await;
-                *balances_guard = balance_snapshot;
+                *balances_guard = temp_balance_snapshot.clone();
+                balance_snapshot = temp_balance_snapshot;
             }
         } else {
             report.push_str("  ⚠️ Schwab API client not initialized.\n\n");
@@ -664,11 +666,14 @@ impl TradingBot {
                             if position_details.is_empty() {
                                 report.push_str("(No Open Positions)\n\n");
                             } else {
-                                report.push_str("Symbol Qty      AvgPrice MV     Cost   P / L  \n");
-                                report.push_str("------ -------- -------- ------ ------ ------ \n");
+                                report.push_str("Symbol Qty      AvgPrice MV     Cost   P / L  Weight \n");
+                                report.push_str("------ -------- -------- ------ ------ ------ ------ \n");
 
                                 let mut total_market_value = 0.0;
                                 let mut total_profit_loss = 0.0;
+
+                                // Calculate total portfolio value (holdings + cash)
+                                let total_portfolio_value = balance_snapshot.get(&account_hash).copied().unwrap_or(0.0);
 
                                 for pos in &position_details {
                                     let side = if pos.is_short { " S" } else { " L" };
@@ -696,16 +701,28 @@ impl TradingBot {
                                         })
                                         .unwrap_or_else(|| "-".to_string());
 
+                                    // Calculate position weight
+                                    let weight = if let Some(mv) = pos.market_value {
+                                        if total_portfolio_value > 0.0 {
+                                            format!("{:.1}%", (mv / total_portfolio_value) * 100.0)
+                                        } else {
+                                            "-".to_string()
+                                        }
+                                    } else {
+                                        "-".to_string()
+                                    };
+
                                     let short_symbol: String = pos.symbol.chars().take(5).collect();
 
                                     report.push_str(&format!(
-                                        "{:<6} {:>8} {:>8} {:>6} {:>6} {:>6} \n",
+                                        "{:<6} {:>8} {:>8} {:>6} {:>6} {:>6} {:>6} \n",
                                         short_symbol,
                                         quantity_display,
                                         avg_price,
                                         market_value,
                                         cost_basis,
-                                        profit_loss
+                                        profit_loss,
+                                        weight
                                     ));
                                 }
 
@@ -752,11 +769,14 @@ impl TradingBot {
                         if position_details.is_empty() {
                             report.push_str("(No Open Positions)\n\n");
                         } else {
-                            report.push_str("Symbol Qty      AvgPrice MV     Cost   P / L  \n");
-                            report.push_str("------ -------- -------- ------ ------ ------ \n");
+                            report.push_str("Symbol Qty      AvgPrice MV     Cost   P / L  Weight \n");
+                            report.push_str("------ -------- -------- ------ ------ ------ ------ \n");
 
                             let mut total_market_value = 0.0;
                             let mut total_profit_loss = 0.0;
+
+                            // Calculate total portfolio value (holdings + cash)
+                            let total_portfolio_value = balance_snapshot.get(&account_hash).copied().unwrap_or(0.0);
 
                             for pos in &position_details {
                                 let side = if pos.is_short { " S" } else { " L" };
@@ -784,16 +804,28 @@ impl TradingBot {
                                     })
                                     .unwrap_or_else(|| "-".to_string());
 
+                                // Calculate position weight
+                                let weight = if let Some(mv) = pos.market_value {
+                                    if total_portfolio_value > 0.0 {
+                                        format!("{:.1}%", (mv / total_portfolio_value) * 100.0)
+                                    } else {
+                                        "-".to_string()
+                                    }
+                                } else {
+                                    "-".to_string()
+                                };
+
                                 let short_symbol: String = pos.symbol.chars().take(5).collect();
 
                                 report.push_str(&format!(
-                                    "{:<6} {:>8} {:>8} {:>6} {:>6} {:>6} \n",
+                                    "{:<6} {:>8} {:>8} {:>6} {:>6} {:>6} {:>6} \n",
                                     short_symbol,
                                     quantity_display,
                                     avg_price,
                                     market_value,
                                     cost_basis,
-                                    profit_loss
+                                    profit_loss,
+                                    weight
                                 ));
                             }
 
@@ -1256,14 +1288,11 @@ impl TradingBot {
         };
 
         for (symbol, quote) in tracked_symbols {
-            let (action, amount, limit_price) = match quote.percent_change {
-                Some(change) if change >= symbol.exit_threshold => {
-                    ("SELL".to_string(), symbol.exit_amount, quote.last_price.unwrap() * 100.5 / 100.0)
-                }
-                Some(change) if change <= symbol.entry_threshold => {
-                    ("BUY".to_string(), symbol.entry_amount, quote.last_price.unwrap() * 99.5 / 100.0)
-                }
-                _ => ("HOLD".to_string(), 0.0, quote.last_price.unwrap()),  // Changed 0 to 0.0 for f64 consistency
+            let (action, amount, limit_price) = match symbol.strategy.as_str() {
+                "mean_reversion" => self.generate_volatility_capture_signal(&symbol, &quote),
+                "momentum" => self.generate_momentum_signal(&symbol, &quote),
+                "volatility_breakout" => self.generate_volatility_breakout_signal(&symbol, &quote),
+                _ => ("HOLD".to_string(), 0.0, quote.last_price.unwrap_or(0.0)),
             };
 
             let key = format!("{}@{}", symbol.symbol, symbol.account_hash);
@@ -1291,12 +1320,75 @@ impl TradingBot {
         signals
     }
 
+    /// Generate signal using volatility capture strategy
+    fn generate_volatility_capture_signal(&self, symbol: &Symbol, quote: &RealTimeQuote) -> (String, f64, f64) {
+        match quote.percent_change {
+            Some(change) if change >= symbol.exit_threshold => {
+                ("SELL".to_string(), symbol.exit_amount, quote.last_price.unwrap_or(0.0) * 100.5 / 100.0)
+            }
+            Some(change) if change <= symbol.entry_threshold => {
+                ("BUY".to_string(), symbol.entry_amount, quote.last_price.unwrap_or(0.0) * 99.5 / 100.0)
+            }
+            _ => ("HOLD".to_string(), 0.0, quote.last_price.unwrap_or(0.0)),
+        }
+    }
+
+    /// Generate signal using momentum strategy
+    fn generate_momentum_signal(&self, symbol: &Symbol, quote: &RealTimeQuote) -> (String, f64, f64) {
+        // Momentum strategy: Buy on strong upward momentum, sell on strong downward momentum
+        // Uses volume confirmation and percentage change thresholds
+        let base_price = quote.last_price.unwrap_or(0.0);
+
+        match (quote.percent_change, quote.total_volume, quote.avg_10_day_volume) {
+            (Some(change), Some(volume), Some(avg_volume)) if volume > avg_volume * 1.5 => {
+                // High volume confirms the move
+                if change >= symbol.exit_threshold {
+                    // Strong upward momentum - BUY
+                    ("BUY".to_string(), symbol.entry_amount, base_price * 99.5 / 100.0)
+                } else if change <= symbol.entry_threshold {
+                    // Strong downward momentum - SELL
+                    ("SELL".to_string(), symbol.exit_amount, base_price * 100.5 / 100.0)
+                } else {
+                    ("HOLD".to_string(), 0.0, base_price)
+                }
+            }
+            _ => ("HOLD".to_string(), 0.0, base_price),
+        }
+    }
+
+    /// Generate signal using volatility breakout strategy
+    fn generate_volatility_breakout_signal(&self, symbol: &Symbol, quote: &RealTimeQuote) -> (String, f64, f64) {
+        // Volatility breakout strategy: Buy on breakouts above resistance, sell on breakouts below support
+        // This is a simplified version - in practice you'd need historical price data
+        let base_price = quote.last_price.unwrap_or(0.0);
+
+        match (quote.percent_change, quote.total_volume, quote.avg_10_day_volume) {
+            (Some(change), Some(volume), Some(avg_volume)) => {
+                let volatility_threshold = 3.0; // 3% move indicates breakout
+                let volume_multiplier = 2.0; // Volume should be 2x average for confirmation
+
+                if change.abs() >= volatility_threshold && volume >= avg_volume * volume_multiplier {
+                    if change > 0.0 {
+                        // Bullish breakout - BUY
+                        ("BUY".to_string(), symbol.entry_amount, base_price * 100.0 / 100.0)
+                    } else {
+                        // Bearish breakout - SELL
+                        ("SELL".to_string(), symbol.exit_amount, base_price * 100.0 / 100.0)
+                    }
+                } else {
+                    ("HOLD".to_string(), 0.0, base_price)
+                }
+            }
+            _ => ("HOLD".to_string(), 0.0, base_price),
+        }
+    }
+
 
     async fn evaluate_order_risks(
         &self,
         api: &Api<SharedTokenChecker>,
         account_hash: &str,
-        symbol: &str,
+        symbol_cfg: &Symbol,
         instruction: Instruction,
         qty: f64,
         limit_price: f64,
@@ -1313,7 +1405,7 @@ impl TradingBot {
             if available_cash + f64::EPSILON < order_notional {
                 return Err(format!(
                     "Insufficient cash to buy {} shares of {} for ${:.2}; available ${:.2}",
-                    qty, symbol, order_notional, available_cash
+                    qty, symbol_cfg.symbol, order_notional, available_cash
                 ));
             }
             cached_balances = Some(balances);
@@ -1348,7 +1440,7 @@ impl TradingBot {
             let positions = self.positions.lock().await;
             positions
                 .get(account_hash)
-                .and_then(|m| m.get(symbol))
+                .and_then(|m| m.get(&symbol_cfg.symbol))
                 .copied()
                 .unwrap_or(0.0)
         };
@@ -1358,13 +1450,13 @@ impl TradingBot {
             if available_to_sell <= f64::EPSILON {
                 return Err(format!(
                     "Cannot sell {} when no long position exists (current qty: {:.2})",
-                    symbol, held_quantity
+                    symbol_cfg.symbol, held_quantity
                 ));
             }
             if qty - available_to_sell > 1e-6 {
                 return Err(format!(
                     "Sell quantity {:.2} exceeds held amount {:.2} for {}",
-                    qty, available_to_sell, symbol
+                    qty, available_to_sell, symbol_cfg.symbol
                 ));
             }
         }
@@ -1373,18 +1465,18 @@ impl TradingBot {
             let reference_price = {
                 let prices = self.real_time_prices.lock().await;
                 prices
-                    .get(symbol)
+                    .get(&symbol_cfg.symbol)
                     .and_then(|q| q.last_price)
                     .unwrap_or(limit_price)
             };
 
             let existing_notional = (held_quantity.max(0.0)) * reference_price;
             let projected_notional = existing_notional + order_notional;
-            let threshold = portfolio_value * 0.01;
+            let threshold = portfolio_value * symbol_cfg.max_weight;
             if projected_notional > threshold {
                 return Err(format!(
-                    "Order would raise {} exposure to ${:.2}, > 1% cap (${:.2}) on portfolio ${:.2}",
-                    symbol, projected_notional, threshold, portfolio_value
+                    "Order would raise {} exposure to ${:.2}, > {:.1}% cap (${:.2}) on portfolio ${:.2}",
+                    symbol_cfg.symbol, projected_notional, symbol_cfg.max_weight * 100.0, threshold, portfolio_value
                 ));
             }
         }
@@ -1392,7 +1484,7 @@ impl TradingBot {
         // Risk check 3: ensure limit price is in line with last trade
         if let Some(last_price) = {
             let prices = self.real_time_prices.lock().await;
-            prices.get(symbol).and_then(|q| q.last_price)
+            prices.get(&symbol_cfg.symbol).and_then(|q| q.last_price)
         } {
             if last_price > 0.0 {
                 let deviation = ((limit_price - last_price) / last_price).abs();
@@ -1510,7 +1602,7 @@ impl TradingBot {
                 self.evaluate_order_risks(
                     api,
                     &symbol_cfg.account_hash,
-                    &symbol_cfg.symbol,
+                    symbol_cfg,
                     instruction,
                     qty,
                     limit_price,
@@ -1711,7 +1803,7 @@ impl TradingBot {
             self.evaluate_order_risks(
                 api,
                 &symbol_cfg.account_hash,
-                &symbol_cfg.symbol,
+                symbol_cfg,
                 instruction,
                 qty,
                 rounded_price,

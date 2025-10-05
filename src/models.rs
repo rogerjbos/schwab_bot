@@ -41,4 +41,6 @@ pub struct Symbol {
     pub exit_amount: f64,
     pub entry_threshold: f64,
     pub exit_threshold: f64,
+    pub strategy: String,
+    pub max_weight: f64,
 }

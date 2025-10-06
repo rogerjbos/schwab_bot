@@ -564,7 +564,7 @@ impl TradingBot {
             return report;
         }
 
-        report.push_str("Balance Summary:\n");
+        // Fetch balances for use in position calculations
         let mut balance_snapshot = HashMap::new();
         let mut cash_snapshot = HashMap::new();
         if let Some(api) = self.api.as_ref() {
@@ -572,50 +572,24 @@ impl TradingBot {
             let mut temp_cash_snapshot = HashMap::new();
 
             for account_hash in &self.account_hashes {
-                let label = if account_hash.len() > 8 {
-                    format!(
-                        "{}…{}",
-                        &account_hash[..4],
-                        &account_hash[account_hash.len() - 4..]
-                    )
-                } else {
-                    account_hash.clone()
-                };
-
-                report.push_str(&format!("Account {}:\n", label));
-
                 match Self::get_balance(api, account_hash).await {
                     Ok(balances) if balances.len() == 2 => {
-                        report.push_str(&format!(
-                            "Cash Available for Trading: ${:.2}\n",
-                            balances[0]
-                        ));
-                        report.push_str(&format!(
-                            "Liquidation Value:           ${:.2}\n",
-                            balances[1]
-                        ));
                         temp_balance_snapshot.insert(account_hash.clone(), balances[1]);
                         temp_cash_snapshot.insert(account_hash.clone(), balances[0]);
                     }
                     Ok(balances) if balances.len() == 3 => {
-                        report.push_str(&format!("Available Funds: ${:.2}\n", balances[0]));
-                        report.push_str(&format!("Buying Power:    ${:.2}\n", balances[1]));
-                        report.push_str(&format!("Equity:          ${:.2}\n", balances[2]));
                         temp_balance_snapshot.insert(account_hash.clone(), balances[2]);
                         temp_cash_snapshot.insert(account_hash.clone(), balances[0]);
                     }
                     Ok(other) => {
-                        report.push_str("⚠️ Received unexpected balance payload from Schwab.\n");
                         if let Some(last) = other.last() {
                             temp_balance_snapshot.insert(account_hash.clone(), *last);
                         }
                     }
-                    Err(err) => {
-                        report.push_str(&format!("⚠️ Unable to fetch balances: {}\n", err));
+                    Err(_) => {
+                        // Silently ignore balance fetch errors for status report
                     }
                 }
-
-                report.push_str("\n");
             }
 
             if !temp_balance_snapshot.is_empty() {
@@ -624,8 +598,6 @@ impl TradingBot {
                 balance_snapshot = temp_balance_snapshot;
                 cash_snapshot = temp_cash_snapshot;
             }
-        } else {
-            report.push_str("  ⚠️ Schwab API client not initialized.\n\n");
         }
 
         for account_hash in self.account_hashes.clone() {
@@ -695,10 +667,27 @@ impl TradingBot {
                                 }
                                 let portfolio_total = cash + total_market_value;
                                 balance_snapshot.insert(account_hash.clone(), portfolio_total);
+                                
+                                // Sort positions by weight (largest to smallest)
+                                let mut sorted_positions: Vec<_> = position_details.iter().map(|pos| {
+                                    let weight = if let Some(mv) = pos.market_value {
+                                        if portfolio_total > 0.0 {
+                                            (mv / portfolio_total) * 100.0
+                                        } else {
+                                            0.0
+                                        }
+                                    } else {
+                                        0.0
+                                    };
+                                    (pos, weight)
+                                }).collect();
+                                
+                                sorted_positions.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                                
                                 // Then, the table
                                 report.push_str("Symbol Qty      AvgPrice MV     Cost   P / L  Weight \n");
                                 report.push_str("------ -------- -------- ------ ------ ------ ------ \n");
-                                for pos in &position_details {
+                                for (pos, weight_value) in sorted_positions {
                                     let side = if pos.is_short { " S" } else { " L" };
                                     let quantity_display = format!("{:.0}{}", pos.quantity, side);
                                     let avg_price = pos
@@ -717,16 +706,8 @@ impl TradingBot {
                                         .profit_loss
                                         .map(|v| format_currency(v))
                                         .unwrap_or_else(|| "-".to_string());
-                                    // Calculate position weight
-                                    let weight = if let Some(mv) = pos.market_value {
-                                        if portfolio_total > 0.0 {
-                                            format!("{:.1}%", (mv / portfolio_total) * 100.0)
-                                        } else {
-                                            "-".to_string()
-                                        }
-                                    } else {
-                                        "-".to_string()
-                                    };
+                                    // Use pre-calculated weight
+                                    let weight = format!("{:.1}%", weight_value);
                                     let short_symbol: String = pos.symbol.chars().take(5).collect();
                                     report.push_str(&format!(
                                         "{:<6} {:>8} {:>8} {:>6} {:>6} {:>6} {:>6} \n",
@@ -790,10 +771,27 @@ impl TradingBot {
                             }
                             let portfolio_total = cash + total_market_value;
                             balance_snapshot.insert(account_hash.clone(), portfolio_total);
+                            
+                            // Sort positions by weight (largest to smallest)
+                            let mut sorted_positions: Vec<_> = position_details.iter().map(|pos| {
+                                let weight = if let Some(mv) = pos.market_value {
+                                    if portfolio_total > 0.0 {
+                                        (mv / portfolio_total) * 100.0
+                                    } else {
+                                        0.0
+                                    }
+                                } else {
+                                    0.0
+                                };
+                                (pos, weight)
+                            }).collect();
+                            
+                            sorted_positions.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                            
                             // Then, the table
                             report.push_str("Symbol Qty      AvgPrice MV     Cost   P / L  Weight \n");
                             report.push_str("------ -------- -------- ------ ------ ------ ------ \n");
-                            for pos in &position_details {
+                            for (pos, weight_value) in sorted_positions {
                                 let side = if pos.is_short { " S" } else { " L" };
                                 let quantity_display = format!("{:.0}{}", pos.quantity, side);
                                 let avg_price = pos
@@ -812,16 +810,8 @@ impl TradingBot {
                                     .profit_loss
                                     .map(|v| format_currency(v))
                                     .unwrap_or_else(|| "-".to_string());
-                                // Calculate position weight
-                                let weight = if let Some(mv) = pos.market_value {
-                                    if portfolio_total > 0.0 {
-                                        format!("{:.1}%", (mv / portfolio_total) * 100.0)
-                                    } else {
-                                        "-".to_string()
-                                    }
-                                } else {
-                                    "-".to_string()
-                                };
+                                // Use pre-calculated weight
+                                let weight = format!("{:.1}%", weight_value);
                                 let short_symbol: String = pos.symbol.chars().take(5).collect();
                                 report.push_str(&format!(
                                     "{:<6} {:>8} {:>8} {:>6} {:>6} {:>6} {:>6} \n",
@@ -1246,8 +1236,8 @@ impl TradingBot {
 
         if !tracked_symbols.is_empty() {
             report.push_str("Tracked Symbols:\n");
-            report.push_str("Symbol S Last  %Chg  Vol (K) 10dVol (K)\n");
-            report.push_str("------ - ----- ----- ------- ----------\n");
+            report.push_str("Symbol S Last    %Chg   Vol (K)  10dVol (K)\n");
+            report.push_str("------ - ------- ------ -------- ----------\n");
             for (symbol_cfg, quote) in tracked_symbols {
                 let signal = match quote.percent_change {
                     Some(change) if change >= symbol_cfg.exit_threshold => "S",
@@ -1274,7 +1264,7 @@ impl TradingBot {
                 let short_symbol: String = symbol_cfg.symbol.chars().take(5).collect();
 
                 report.push_str(&format!(
-                    "{:<5} {:>2} {:>7} {:>6} {:>8} {:>9}\n",
+                    "{:<5} {:>2} {:>7} {:>6} {:>8} {:>10}\n",
                     short_symbol, signal, last, pct, volume, avg_volume
                 ));
             }

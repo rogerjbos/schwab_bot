@@ -739,10 +739,10 @@ impl TradingBot {
                                         weight
                                     ));
                                 }
-                                // Summary
+                                // Summary for IBKR
                                 let pnl_icon = if total_profit_loss >= 0.0 { "📈" } else { "📉" };
                                 report.push_str(&format!(
-                                    "\n💰 ${:.2}  💼 ${:.2}  🏦 ${:.2}  {} ${:.2}\n\n",
+                                    "\n💰 ${:.0} 💼 ${:.0} 🏦 ${:.0} {} ${:.0}\n\n",
                                     cash, total_market_value, portfolio_total, pnl_icon, total_profit_loss
                                 ));
                             }
@@ -834,10 +834,10 @@ impl TradingBot {
                                     weight
                                 ));
                             }
-                            // Summary
+                            // Summary for schwab
                             let pnl_icon = if total_profit_loss >= 0.0 { "📈" } else { "📉" };
                             report.push_str(&format!(
-                                "\n💰 ${:.2}  💼 ${:.2}  🏦 ${:.2}  {} ${:.2}\n\n",
+                                "\n💰 ${:.0} 💼 ${:.0} 🏦 ${:.0} {} ${:.0}\n\n",
                                 cash, total_market_value, portfolio_total, pnl_icon, total_profit_loss
                             ));
                         }
@@ -854,7 +854,7 @@ impl TradingBot {
             let lookback_start = lookback_end - chrono::Duration::days(30);
             let mut any_open_orders = false;
 
-            report.push_str("Recent Orders (last 30 days):\n");
+            report.push_str("Recent Orders:\n");
 
             for account_hash in &self.account_hashes {
                 let label = if account_hash.len() > 8 {
@@ -1044,7 +1044,8 @@ impl TradingBot {
                                 let status_desc = order.status_description.as_deref().unwrap_or("");
 
                                 account_section.push_str(&format!(
-                                    "• {:5} {:<1} {:<6} {:>6} {:<5} {} {}",
+                                    "{:5} {} {}{} {} {} {}",
+                                    // "• {:5} {:<1} {:<6} {:>6} {:<5} {} {}",
                                     symbol_text,
                                     instruction_text,
                                     qty_text,
@@ -1089,12 +1090,12 @@ impl TradingBot {
                                 {
                                     if let Some(orders) = json.as_array() {
                                         for order in orders {
-                                            let status = order
+                                            let status_label = order
                                                 .get("status")
                                                 .and_then(|s| s.as_str())
                                                 .unwrap_or("");
                                             let is_closed = matches!(
-                                                status,
+                                                status_label,
                                                 "Filled"
                                                     | "Cancelled"
                                                     | "Canceled"
@@ -1133,6 +1134,9 @@ impl TradingBot {
                                                         .get("instruction")
                                                         .and_then(|v| v.as_str())
                                                         .unwrap_or("-")
+                                                        .chars()
+                                                        .next()
+                                                        .unwrap_or('?')
                                                         .to_string();
                                                     let qty = first_leg
                                                         .get("quantity")
@@ -1157,21 +1161,31 @@ impl TradingBot {
                                                 .map(|price| format!(" @ ${:.2}", price))
                                                 .unwrap_or_default();
 
-                                            let entered_time = order
+                                            let entered_local = order
                                                 .get("enteredTime")
-                                                .and_then(|v| v.as_str())
-                                                .unwrap_or("");
+                                                .and_then(|v| {
+                                                    if let Some(time_str) = v.as_str() {
+                                                        chrono::NaiveDateTime::parse_from_str(time_str, "%Y-%m-%dT%H:%M:%S+0000")
+                                                            .ok()
+                                                            .map(|ndt| ndt.and_utc())
+                                                    } else if let Some(ts) = v.as_i64() {
+                                                        chrono::DateTime::<chrono::Utc>::from_timestamp(ts, 0)
+                                                    } else {
+                                                        None
+                                                    }
+                                                })
+                                                .map(|dt| dt.with_timezone(&chrono::Local).format("%m-%d").to_string())
+                                                .unwrap_or("--".to_string());
 
                                             account_section.push_str(&format!(
-                                                "  • {:<12} {:<12} {:<6} {:>6} {:<8}{}{} (entered {})",
-                                                order.get("orderId").and_then(|v| v.as_i64()).map(|id| format!("#{}", id)).unwrap_or_else(|| "-".to_string()),
-                                                status,
+                                                "{:5} {} {}{} {} {} {}",
+                                                symbol_text,
                                                 instruction_text,
                                                 qty_text,
-                                                symbol_text,
                                                 price_text,
-                                                leg_note,
-                                                entered_time
+                                                status_label,
+                                                entered_local,
+                                                order.get("orderId").and_then(|v| v.as_i64()).map(|id| format!("#{}", id)).unwrap_or_else(|| "-".to_string())
                                             ));
 
                                             account_section.push('\n');
@@ -1205,7 +1219,7 @@ impl TradingBot {
             }
 
             if !any_open_orders {
-                report.push_str("  (no open orders found in the past 30 days)\n");
+                report.push_str("  (no open orders found)\n");
             }
 
             report.push_str("\n");
@@ -1232,8 +1246,8 @@ impl TradingBot {
 
         if !tracked_symbols.is_empty() {
             report.push_str("Tracked Symbols:\n");
-            report.push_str("Symbol S Last  %Chg  Volume 10DVol\n");
-            report.push_str("------ - ----- ----- ------ ------\n");
+            report.push_str("Symbol S Last  %Chg  Vol (K) 10dVol (K)\n");
+            report.push_str("------ - ----- ----- ------- ----------\n");
             for (symbol_cfg, quote) in tracked_symbols {
                 let signal = match quote.percent_change {
                     Some(change) if change >= symbol_cfg.exit_threshold => "S",
@@ -1260,7 +1274,7 @@ impl TradingBot {
                 let short_symbol: String = symbol_cfg.symbol.chars().take(5).collect();
 
                 report.push_str(&format!(
-                    "{:<6} {:>2} {:>6} {:>6} {:>6} {:>6}\n",
+                    "{:<5} {:>2} {:>7} {:>6} {:>8} {:>9}\n",
                     short_symbol, signal, last, pct, volume, avg_volume
                 ));
             }
@@ -1471,11 +1485,12 @@ impl TradingBot {
 
             let existing_notional = (held_quantity.max(0.0)) * reference_price;
             let projected_notional = existing_notional + order_notional;
-            let threshold = portfolio_value * symbol_cfg.max_weight;
+            // weight should be already multiplied by 100 in config
+            let threshold = portfolio_value * (symbol_cfg.max_weight / 100.0);
             if projected_notional > threshold {
                 return Err(format!(
                     "Order would raise {} exposure to ${:.2}, > {:.1}% cap (${:.2}) on portfolio ${:.2}",
-                    symbol_cfg.symbol, projected_notional, symbol_cfg.max_weight * 100.0, threshold, portfolio_value
+                    symbol_cfg.symbol, projected_notional, symbol_cfg.max_weight, threshold, portfolio_value
                 ));
             }
         }
